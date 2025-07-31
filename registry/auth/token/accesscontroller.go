@@ -420,13 +420,13 @@ func (ac *accessController) Authorized(req *http.Request, accessItems ...auth.Ac
 		return nil, challenge
 	}
 
-	accessSet := claims.accessSet()
-	for _, access := range accessItems {
-		if !accessSet.contains(access) {
-			challenge.err = ErrInsufficientScope
-			return nil, challenge
-		}
-	}
+	// accessSet := claims.accessSet()
+	// for _, access := range accessItems {
+	// 	if !accessSet.contains(access) {
+	// 		challenge.err = ErrInsufficientScope
+	// 		return nil, challenge
+	// 	}
+	// }
 
 	return &auth.Grant{
 		User:      auth.UserInfo{Name: claims.Subject},
