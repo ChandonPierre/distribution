@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"path"
 	"reflect"
@@ -15,6 +16,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/service/s3"
@@ -384,6 +386,191 @@ func TestClientTransport(t *testing.T) {
 				t.Errorf("unexpected S3 driver client transport")
 			}
 		})
+	}
+}
+
+func TestContainerCredentials(t *testing.T) {
+	// Spin up a local HTTP server that speaks the container credentials protocol.
+	// https://docs.aws.amazon.com/sdkref/latest/guide/feature-container-credentials.html
+	const wantToken = "test-bearer-token"
+	var gotAuthHeader string
+
+	credSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotAuthHeader = r.Header.Get("Authorization")
+		w.Header().Set("Content-Type", "application/json")
+		// Return a static (non-expiring) credential response.
+		fmt.Fprintf(w, `{"AccessKeyId":"AKIAIOSFODNN7EXAMPLE","SecretAccessKey":"wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"}`)
+	}))
+	defer credSrv.Close()
+
+	baseParams := map[string]any{
+		"region":              "us-east-1",
+		"bucket":              "test-bucket",
+		"credentialsendpoint": credSrv.URL,
+		// Force a custom endpoint so the driver doesn't try to reach real AWS.
+		"regionendpoint": "http://localhost:1",
+	}
+
+	t.Run("StaticToken", func(t *testing.T) {
+		params := map[string]any{}
+		for k, v := range baseParams {
+			params[k] = v
+		}
+		params["credentialstoken"] = wantToken
+
+		drv, err := FromParameters(context.TODO(), params)
+		if err != nil {
+			t.Fatalf("FromParameters: %v", err)
+		}
+
+		// Trigger a credential fetch by calling Credentials.Get on the underlying session.
+		inner := drv.baseEmbed.Base.StorageDriver.(*driver)
+		if _, err := inner.S3.Client.Config.Credentials.Get(); err != nil {
+			t.Fatalf("credentials.Get: %v", err)
+		}
+
+		want := wantToken
+		if gotAuthHeader != want {
+			t.Errorf("Authorization header: got %q, want %q", gotAuthHeader, want)
+		}
+	})
+
+	t.Run("TokenFile", func(t *testing.T) {
+		f, err := os.CreateTemp(t.TempDir(), "token*")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := f.WriteString(wantToken); err != nil {
+			t.Fatal(err)
+		}
+		f.Close()
+
+		params := map[string]any{}
+		for k, v := range baseParams {
+			params[k] = v
+		}
+		params["credentialstokenfile"] = f.Name()
+
+		drv, err := FromParameters(context.TODO(), params)
+		if err != nil {
+			t.Fatalf("FromParameters: %v", err)
+		}
+
+		inner := drv.baseEmbed.Base.StorageDriver.(*driver)
+		if _, err := inner.S3.Client.Config.Credentials.Get(); err != nil {
+			t.Fatalf("credentials.Get: %v", err)
+		}
+
+		want := wantToken
+		if gotAuthHeader != want {
+			t.Errorf("Authorization header: got %q, want %q", gotAuthHeader, want)
+		}
+	})
+
+	t.Run("NoToken", func(t *testing.T) {
+		// endpoint set but no token — Authorization header should be absent.
+		drv, err := FromParameters(context.TODO(), baseParams)
+		if err != nil {
+			t.Fatalf("FromParameters: %v", err)
+		}
+
+		inner := drv.baseEmbed.Base.StorageDriver.(*driver)
+		gotAuthHeader = ""
+		if _, err := inner.S3.Client.Config.Credentials.Get(); err != nil {
+			t.Fatalf("credentials.Get: %v", err)
+		}
+		if gotAuthHeader != "" {
+			t.Errorf("expected no Authorization header, got %q", gotAuthHeader)
+		}
+	})
+}
+
+func TestContainerCredentialsTokenFileRotation(t *testing.T) {
+	// Verify the token file is re-read on each credential refresh (rotation support).
+	var gotAuthHeader string
+
+	credSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotAuthHeader = r.Header.Get("Authorization")
+		w.Header().Set("Content-Type", "application/json")
+		// Return expiring credentials so the provider will re-fetch on next Get().
+		expiry := time.Now().UTC().Add(time.Minute).Format(time.RFC3339)
+		fmt.Fprintf(w, `{"AccessKeyId":"AKIA1","SecretAccessKey":"secret1","Token":"tok","Expiration":%q}`, expiry)
+	}))
+	defer credSrv.Close()
+
+	f, err := os.CreateTemp(t.TempDir(), "token*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString("token-v1"); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+
+	drv, err := FromParameters(context.TODO(), map[string]any{
+		"region":               "us-east-1",
+		"bucket":               "test-bucket",
+		"credentialsendpoint":  credSrv.URL,
+		"credentialstokenfile": f.Name(),
+		"regionendpoint":       "http://localhost:1",
+	})
+	if err != nil {
+		t.Fatalf("FromParameters: %v", err)
+	}
+	inner := drv.baseEmbed.Base.StorageDriver.(*driver)
+	creds := inner.S3.Client.Config.Credentials
+
+	// First fetch — token-v1.
+	if _, err := creds.Get(); err != nil {
+		t.Fatalf("first Get: %v", err)
+	}
+	if gotAuthHeader != "token-v1" {
+		t.Errorf("first fetch: got %q, want %q", gotAuthHeader, "token-v1")
+	}
+
+	// Rotate the token file and force credential expiry so Get() re-fetches.
+	if err := os.WriteFile(f.Name(), []byte("token-v2"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	creds.Expire()
+
+	if _, err := creds.Get(); err != nil {
+		t.Fatalf("second Get: %v", err)
+	}
+	if gotAuthHeader != "token-v2" {
+		t.Errorf("second fetch: got %q, want %q", gotAuthHeader, "token-v2")
+	}
+}
+
+func TestContainerCredentialsMutuallyExclusive(t *testing.T) {
+	// credentialsendpoint and accesskey/secretkey must not be set simultaneously.
+	// The driver should choose endpoint creds over static creds when both are present
+	// (endpoint creds take precedence in the switch).
+	credSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintf(w, `{"AccessKeyId":"ENDPOINT_KEY","SecretAccessKey":"endpoint_secret"}`)
+	}))
+	defer credSrv.Close()
+
+	drv, err := FromParameters(context.TODO(), map[string]any{
+		"region":              "us-east-1",
+		"bucket":              "test-bucket",
+		"accesskey":           "STATIC_KEY",
+		"secretkey":           "static_secret",
+		"credentialsendpoint": credSrv.URL,
+		"regionendpoint":      "http://localhost:1",
+	})
+	if err != nil {
+		t.Fatalf("FromParameters: %v", err)
+	}
+
+	inner := drv.baseEmbed.Base.StorageDriver.(*driver)
+	val, err := inner.S3.Client.Config.Credentials.Get()
+	if err != nil {
+		t.Fatalf("credentials.Get: %v", err)
+	}
+	// Endpoint credentials should win.
+	if val.AccessKeyID != "ENDPOINT_KEY" {
+		t.Errorf("expected endpoint creds to win, got AccessKeyID=%q", val.AccessKeyID)
 	}
 }
 

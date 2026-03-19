@@ -164,6 +164,8 @@ storage:
     usedualstack: false
     usefipsendpoint: false
     loglevel: debug
+    credentialsendpoint: http://169.254.170.23/v1/credentials
+    credentialstokenfile: /var/run/secrets/pods.eks.amazonaws.com/serviceaccount/token
   inmemory:  # This driver takes no parameters
   tag:
     concurrencylimit: 8
@@ -458,6 +460,8 @@ storage:
     rootdirectory: /s3/object/name/prefix
     usefipsendpoint: false
     loglevel: debug
+    credentialsendpoint: http://169.254.170.23/v1/credentials
+    credentialstokenfile: /var/run/secrets/pods.eks.amazonaws.com/serviceaccount/token
   inmemory:
   delete:
     enabled: false

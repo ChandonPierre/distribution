@@ -20,6 +20,7 @@ import (
 	"io"
 	"math"
 	"net/http"
+	"os"
 	"path/filepath"
 	"slices"
 	"sort"
@@ -31,6 +32,7 @@ import (
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/awserr"
 	"github.com/aws/aws-sdk-go/aws/credentials"
+	"github.com/aws/aws-sdk-go/aws/credentials/endpointcreds"
 	"github.com/aws/aws-sdk-go/aws/endpoints"
 	"github.com/aws/aws-sdk-go/aws/request"
 	"github.com/aws/aws-sdk-go/aws/session"
@@ -116,6 +118,9 @@ type DriverParameters struct {
 	Accelerate                  bool
 	UseFIPSEndpoint             bool
 	LogLevel                    aws.LogLevelType
+	CredentialsEndpoint         string
+	CredentialsToken            string
+	CredentialsTokenFile        string
 }
 
 func init() {
@@ -195,6 +200,19 @@ func FromParameters(ctx context.Context, parameters map[string]any) (*Driver, er
 	secretKey := parameters["secretkey"]
 	if secretKey == nil {
 		secretKey = ""
+	}
+
+	credentialsEndpoint := parameters["credentialsendpoint"]
+	if credentialsEndpoint == nil {
+		credentialsEndpoint = ""
+	}
+	credentialsToken := parameters["credentialstoken"]
+	if credentialsToken == nil {
+		credentialsToken = ""
+	}
+	credentialsTokenFile := parameters["credentialstokenfile"]
+	if credentialsTokenFile == nil {
+		credentialsTokenFile = ""
 	}
 
 	regionEndpoint := parameters["regionendpoint"]
@@ -366,6 +384,9 @@ func FromParameters(ctx context.Context, parameters map[string]any) (*Driver, er
 		Accelerate:                  accelerateBool,
 		UseFIPSEndpoint:             useFIPSEndpointBool,
 		LogLevel:                    getS3LogLevelFromParam(parameters["loglevel"]),
+		CredentialsEndpoint:         fmt.Sprint(credentialsEndpoint),
+		CredentialsToken:            fmt.Sprint(credentialsToken),
+		CredentialsTokenFile:        fmt.Sprint(credentialsTokenFile),
 	}
 
 	return New(ctx, params)
@@ -463,7 +484,37 @@ func New(ctx context.Context, params DriverParameters) (*Driver, error) {
 
 	awsConfig := aws.NewConfig().WithLogLevel(params.LogLevel)
 
-	if params.AccessKey != "" && params.SecretKey != "" {
+	switch {
+	case params.CredentialsEndpoint != "":
+		baseSess, err := session.NewSession(awsConfig)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create base session for container credentials: %v", err)
+		}
+		providerOpts := []func(*endpointcreds.Provider){}
+		switch {
+		case params.CredentialsTokenFile != "":
+			providerOpts = append(providerOpts, func(p *endpointcreds.Provider) {
+				p.AuthorizationTokenProvider = endpointcreds.TokenProviderFunc(func() (string, error) {
+					data, err := os.ReadFile(params.CredentialsTokenFile)
+					if err != nil {
+						return "", fmt.Errorf("reading credentials token file %q: %w", params.CredentialsTokenFile, err)
+					}
+					return strings.TrimSpace(string(data)), nil
+				})
+			})
+		case params.CredentialsToken != "":
+			providerOpts = append(providerOpts, func(p *endpointcreds.Provider) {
+				p.AuthorizationToken = params.CredentialsToken
+			})
+		}
+		creds := endpointcreds.NewCredentialsClient(
+			*baseSess.Config,
+			baseSess.Handlers,
+			params.CredentialsEndpoint,
+			providerOpts...,
+		)
+		awsConfig.WithCredentials(creds)
+	case params.AccessKey != "" && params.SecretKey != "":
 		creds := credentials.NewStaticCredentials(
 			params.AccessKey,
 			params.SecretKey,
