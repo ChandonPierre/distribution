@@ -344,6 +344,14 @@ func NewApp(ctx context.Context, config *configuration.Configuration) *App {
 		}
 		app.accessController = accessController
 		dcontext.GetLogger(app).Debugf("configured %q access controller", authType)
+
+		// If the access controller also provides a built-in token endpoint,
+		// register it at /auth/token so Docker clients can exchange credentials
+		// for a short-lived registry JWT without a separate token service.
+		if te, ok := accessController.(auth.TokenEndpointer); ok {
+			app.router.Path("/auth/token").Handler(te.TokenHandler())
+			dcontext.GetLogger(app).Infof("registered built-in token endpoint at /auth/token")
+		}
 	}
 
 	// configure as a pull through cache

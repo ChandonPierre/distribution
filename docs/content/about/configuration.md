@@ -199,6 +199,14 @@ auth:
   htpasswd:
     realm: basic-realm
     path: /path/to/htpasswd
+  kubeoidc:
+    realm: https://registry.example.com/auth/token
+    service: registry.example.com
+    issuers:
+      - https://kubernetes.default.svc
+    policies:
+      - name: allow-pull
+        expression: '"pull" in request["actions"]'
 middleware:
   registry:
     - name: ARegistryMiddleware
@@ -624,6 +632,14 @@ auth:
   htpasswd:
     realm: basic-realm
     path: /path/to/htpasswd
+  kubeoidc:
+    realm: https://registry.example.com/auth/token
+    service: registry.example.com
+    issuers:
+      - https://kubernetes.default.svc
+    policies:
+      - name: allow-pull
+        expression: '"pull" in request["actions"]'
 ```
 
 The `auth` option is **optional**. Possible auth providers include:
@@ -631,6 +647,7 @@ The `auth` option is **optional**. Possible auth providers include:
 - [`silly`](#silly)
 - [`token`](#token)
 - [`htpasswd`](#htpasswd)
+- [`kubeoidc`](#kubeoidc)
 - [`none`]
 
 You can configure only one authentication provider.
@@ -726,6 +743,67 @@ invalid, the registry will display an error and will not start.
 |-----------|----------|-------------------------------------------------------|
 | `realm`   | yes      | The realm in which the registry server authenticates. |
 | `path`    | yes      | The path to the `htpasswd` file to load at startup.   |
+
+### `kubeoidc`
+
+The `kubeoidc` authentication provider validates Kubernetes service account tokens
+directly — no separate token server is required. The registry fetches the cluster's
+public keys via OIDC discovery and validates tokens on every request. Access is
+controlled by [CEL](https://cel.dev/) policy expressions evaluated against the
+token claims and the requested repository/action.
+
+| Parameter                | Required | Description |
+|--------------------------|----------|-------------|
+| `realm`                  | yes      | URL of the token endpoint. Should be `https://<registry-host>/auth/token` — the registry registers this path automatically. Docker clients use this URL to exchange credentials for a registry JWT. |
+| `service`                | no       | Expected audience (`aud`) in incoming SA tokens, and the `service=` value in Bearer challenges. If omitted, the audience check is skipped and CEL policies are solely responsible for access decisions. |
+| `issuers`                | yes      | List of trusted OIDC issuer URLs. Tokens whose `iss` claim is not in this list are rejected without any network call. |
+| `insecure_skip_tls_verify` | no     | Skip TLS verification when fetching OIDC discovery documents and JWKS. Defaults to `false`. |
+| `jwks_refresh_interval`  | no       | How often to check for JWKS key rotation. Defaults to `1h`. Stale keys are served while a background refresh runs (non-blocking). |
+| `signing_key`            | no       | Path to a PEM-encoded ECDSA private key used to sign registry-issued tokens. If omitted, an ephemeral key is generated at startup — tokens will be invalidated on restart, but clients re-authenticate automatically. For multi-replica deployments, provide a stable key. Generate with: `openssl ecparam -name prime256v1 -genkey -noout -out token-signing.pem` |
+| `token_expiry`           | no       | Lifetime of registry-issued tokens. Defaults to `5m`. |
+| `token_issuer`           | no       | The `iss` claim value in registry-issued tokens. Defaults to the value of `service`. |
+| `policies`               | no       | List of inline CEL policy rules (used when `policy_file` is not set). |
+| `policy_file`            | no       | Path to an external YAML file containing the `policies` list. Polled every `policy_reload_interval`. If set, inline `policies` are ignored. |
+| `policy_reload_interval` | no       | How often to poll `policy_file` for changes. Defaults to `30s`. If the reloaded file contains a CEL compile error, the previous policy set remains active. |
+
+Each entry in `policies` has the following fields:
+
+| Field        | Description |
+|--------------|-------------|
+| `name`       | Human-readable name used in log messages. |
+| `expression` | CEL boolean expression. Access is granted if any policy returns `true` (first-match). |
+
+CEL variables available in each expression:
+
+| Variable             | Type            | Description |
+|----------------------|-----------------|-------------|
+| `token["iss"]`       | `string`        | JWT `iss` claim (OIDC issuer URL). |
+| `token["sub"]`       | `string`        | JWT `sub` claim (e.g. `system:serviceaccount:ns:sa`). |
+| `token["aud"]`       | `list(string)`  | JWT `aud` claim. |
+| `request["repository"]` | `string`     | Repository name being accessed (e.g. `myorg/myimage`). |
+| `request["actions"]` | `list(string)`  | Actions requested (e.g. `["pull"]`, `["pull","push"]`). |
+| `request["type"]`    | `string`        | Resource type, usually `"repository"`. |
+
+```yaml
+auth:
+  kubeoidc:
+    realm: https://registry.example.com/auth/token
+    service: registry.example.com
+    issuers:
+      - https://kubernetes.default.svc
+    signing_key: /etc/registry/token-signing.pem  # optional; ephemeral if omitted
+    token_expiry: 10m
+    policies:
+      - name: ci-builders-push
+        expression: |
+          token["sub"].startsWith("system:serviceaccount:ci:") &&
+          request["repository"].startsWith("myorg/") &&
+          "push" in request["actions"]
+      - name: any-cluster-pull
+        expression: |
+          token["sub"].startsWith("system:serviceaccount:") &&
+          request["actions"] == ["pull"]
+```
 
 ## `middleware`
 

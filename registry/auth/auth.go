@@ -114,6 +114,17 @@ type CredentialAuthenticator interface {
 	AuthenticateUser(username, password string) error
 }
 
+// TokenEndpointer is an optional interface that an AccessController may implement
+// to expose a built-in token endpoint (e.g. GET /auth/token).
+// When the registry detects this interface, it registers the handler on the
+// configured token path so that standard Docker clients can exchange credentials
+// for a short-lived registry JWT without a separate token service.
+type TokenEndpointer interface {
+	// TokenHandler returns an http.Handler that serves the token endpoint.
+	// The path at which it is registered is determined by the registry.
+	TokenHandler() http.Handler
+}
+
 // Register is used to register an InitFunc for
 // an AccessController backend with the given name.
 func Register(name string, initFunc InitFunc) error {
