@@ -5,6 +5,7 @@ import (
 
 	"github.com/distribution/distribution/v3/registry"
 	_ "github.com/distribution/distribution/v3/registry/auth/htpasswd"
+	_ "github.com/distribution/distribution/v3/registry/auth/kubeoidc"
 	_ "github.com/distribution/distribution/v3/registry/auth/silly"
 	_ "github.com/distribution/distribution/v3/registry/auth/token"
 	_ "github.com/distribution/distribution/v3/registry/proxy"
