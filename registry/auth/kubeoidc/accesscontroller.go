@@ -1,7 +1,6 @@
 package kubeoidc
 
 import (
-	"crypto/ecdsa"
 	"errors"
 	"fmt"
 	"net/http"
@@ -55,16 +54,16 @@ type policyConfig struct {
 
 // accessController implements auth.AccessController for Kubernetes OIDC service account tokens.
 type accessController struct {
-	realm           string
-	service         string
-	issuerCache     *issuerCacheMap
-	policySet       atomic.Pointer[policySet]
+	realm       string
+	service     string
+	issuerCache *issuerCacheMap
+	policySet   atomic.Pointer[policySet]
 
 	// tokenEndpoint is non-nil when the built-in token exchange endpoint is active.
 	tokenEndpoint *tokenEndpointHandler
-	// localSigningKey is the public key used to validate registry-issued tokens.
-	// It is set to the public half of the token endpoint signing key.
-	localSigningKey *ecdsa.PublicKey
+	// signingKey holds the current key pair used to sign and verify registry-issued tokens.
+	// It is atomically replaced on hot-reload so both signing and verification stay in sync.
+	signingKey atomic.Pointer[signingKeyState]
 	// tokenIssuer is the expected "iss" value for registry-issued tokens.
 	tokenIssuer string
 }
@@ -220,31 +219,37 @@ func newAccessController(options map[string]any) (auth.AccessController, error) 
 	}
 
 	// Load or generate the signing key for the built-in token endpoint.
-	signingKey, keyID, err := loadOrGenerateSigningKey(cfg.SigningKey)
+	initialKey, keyID, err := loadOrGenerateSigningKey(cfg.SigningKey)
 	if err != nil {
 		return nil, fmt.Errorf("kubeoidc: signing key: %w", err)
 	}
 
 	ac := &accessController{
-		realm:           cfg.Realm,
-		service:         cfg.Service,
-		issuerCache:     issuerCache,
-		localSigningKey: &signingKey.PublicKey,
-		tokenIssuer:     tokenIssuer,
+		realm:       cfg.Realm,
+		service:     cfg.Service,
+		issuerCache: issuerCache,
+		tokenIssuer: tokenIssuer,
 	}
+	ac.signingKey.Store(&signingKeyState{
+		privateKey: initialKey,
+		publicKey:  &initialKey.PublicKey,
+		keyID:      keyID,
+	})
 	ac.policySet.Store(&policySet{policies: compiled})
 
 	if cfg.PolicyFile != "" {
 		startPolicyReloader(cfg.PolicyFile, reloadInterval, &ac.policySet, celEnv)
 	}
+	if cfg.SigningKey != "" {
+		startSigningKeyReloader(cfg.SigningKey, reloadInterval, &ac.signingKey)
+	}
 
 	ac.tokenEndpoint = &tokenEndpointHandler{
-		ac:           ac,
-		service:      cfg.Service,
-		issuer:       tokenIssuer,
-		tokenExpiry:  tokenExpiry,
-		signingKey:   signingKey,
-		signingKeyID: keyID,
+		ac:          ac,
+		service:     cfg.Service,
+		issuer:      tokenIssuer,
+		tokenExpiry: tokenExpiry,
+		signingKey:  &ac.signingKey,
 	}
 
 	return ac, nil
@@ -287,7 +292,7 @@ func (ac *accessController) Authorized(req *http.Request, accessItems ...auth.Ac
 
 	// Registry-issued tokens (from our own token endpoint) have iss == tokenIssuer.
 	// Validate them with the local signing key and check their embedded access claims.
-	if unverified.Issuer == ac.tokenIssuer && ac.localSigningKey != nil {
+	if unverified.Issuer == ac.tokenIssuer && ac.signingKey.Load() != nil {
 		return ac.authorizeRegistryToken(parsedToken, unverified.Issuer, accessItems, challenge)
 	}
 
@@ -405,7 +410,7 @@ func (ac *accessController) authorizeRegistryToken(
 	challenge authChallenge,
 ) (*auth.Grant, error) {
 	var claims registryClaims
-	if err := parsedToken.Claims(ac.localSigningKey, &claims); err != nil {
+	if err := parsedToken.Claims(ac.signingKey.Load().publicKey, &claims); err != nil {
 		challenge.err = ErrInvalidToken
 		return nil, challenge
 	}

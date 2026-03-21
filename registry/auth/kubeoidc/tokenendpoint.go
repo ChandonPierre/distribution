@@ -1,10 +1,10 @@
 package kubeoidc
 
 import (
-	"crypto"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/x509"
 	"encoding/json"
 	"encoding/pem"
@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/go-jose/go-jose/v4"
@@ -90,15 +91,21 @@ func loadOrGenerateSigningKey(path string) (*ecdsa.PrivateKey, string, error) {
 	return key, "", nil
 }
 
+// signingKeyState holds a key pair that can be atomically replaced on hot-reload.
+type signingKeyState struct {
+	privateKey *ecdsa.PrivateKey
+	publicKey  *ecdsa.PublicKey
+	keyID      string
+}
+
 // tokenEndpointHandler serves GET/POST /auth/token following the Docker Registry
 // Token Authentication specification.
 type tokenEndpointHandler struct {
-	ac           *accessController
-	service      string
-	issuer       string // "iss" in issued tokens
-	tokenExpiry  time.Duration
-	signingKey   crypto.PrivateKey
-	signingKeyID string
+	ac          *accessController
+	service     string
+	issuer      string // "iss" in issued tokens
+	tokenExpiry time.Duration
+	signingKey  *atomic.Pointer[signingKeyState]
 }
 
 // ServeHTTP implements http.Handler.
@@ -216,12 +223,13 @@ func (h *tokenEndpointHandler) ServeHTTP(w http.ResponseWriter, r *http.Request)
 		Access: grantedAccess,
 	}
 
+	ks := h.signingKey.Load()
 	signerOpts := (&jose.SignerOptions{}).WithType("JWT")
-	if h.signingKeyID != "" {
-		signerOpts = signerOpts.WithHeader("kid", h.signingKeyID)
+	if ks.keyID != "" {
+		signerOpts = signerOpts.WithHeader("kid", ks.keyID)
 	}
 	sig, err := jose.NewSigner(
-		jose.SigningKey{Algorithm: jose.ES256, Key: h.signingKey},
+		jose.SigningKey{Algorithm: jose.ES256, Key: ks.privateKey},
 		signerOpts,
 	)
 	if err != nil {
@@ -308,4 +316,38 @@ func evaluateScopePolicy(ps *policySet, tokenMap map[string]any, scope string) (
 		Name:    resName,
 		Actions: grantedActions,
 	}, true, nil
+}
+
+// startSigningKeyReloader polls path on interval and atomically replaces the
+// signingKeyState when the file changes. On parse error the previous key stays
+// active so in-flight tokens continue to validate.
+func startSigningKeyReloader(path string, interval time.Duration, ptr *atomic.Pointer[signingKeyState]) {
+	var lastHash [32]byte
+	go func() {
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for range ticker.C {
+			data, err := os.ReadFile(path)
+			if err != nil {
+				logrus.Warnf("kubeoidc: signing key reloader cannot read %q: %v", path, err)
+				continue
+			}
+			hash := sha256.Sum256(data)
+			if hash == lastHash {
+				continue
+			}
+			key, _, err := loadOrGenerateSigningKey(path)
+			if err != nil {
+				logrus.Warnf("kubeoidc: signing key reloader failed to load %q: %v — keeping previous key", path, err)
+				continue
+			}
+			ptr.Store(&signingKeyState{
+				privateKey: key,
+				publicKey:  &key.PublicKey,
+				keyID:      path,
+			})
+			lastHash = hash
+			logrus.Infof("kubeoidc: reloaded signing key from %q", path)
+		}
+	}()
 }

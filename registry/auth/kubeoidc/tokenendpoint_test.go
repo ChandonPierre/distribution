@@ -121,7 +121,7 @@ func TestTokenEndpointDeniedScopeOmitted(t *testing.T) {
 	if err != nil {
 		t.Fatalf("parse issued token: %v", err)
 	}
-	if err := parsedToken.Claims(ctrl.localSigningKey, &claims); err != nil {
+	if err := parsedToken.Claims(ctrl.signingKey.Load().publicKey, &claims); err != nil {
 		t.Fatalf("claims: %v", err)
 	}
 
@@ -348,7 +348,7 @@ func TestTokenEndpointMultipleScopes(t *testing.T) {
 	if err != nil {
 		t.Fatalf("parse: %v", err)
 	}
-	if err := parsedToken.Claims(ctrl.localSigningKey, &claims); err != nil {
+	if err := parsedToken.Claims(ctrl.signingKey.Load().publicKey, &claims); err != nil {
 		t.Fatalf("claims: %v", err)
 	}
 

@@ -759,7 +759,7 @@ token claims and the requested repository/action.
 | `issuers`                | yes      | List of trusted OIDC issuer URLs. Tokens whose `iss` claim is not in this list are rejected without any network call. |
 | `insecure_skip_tls_verify` | no     | Skip TLS verification when fetching OIDC discovery documents and JWKS. Defaults to `false`. |
 | `jwks_refresh_interval`  | no       | How often to check for JWKS key rotation. Defaults to `1h`. Stale keys are served while a background refresh runs (non-blocking). |
-| `signing_key`            | no       | Path to a PEM-encoded ECDSA private key used to sign registry-issued tokens. If omitted, an ephemeral key is generated at startup — tokens will be invalidated on restart, but clients re-authenticate automatically. For multi-replica deployments, provide a stable key. Generate with: `openssl ecparam -name prime256v1 -genkey -noout -out token-signing.pem` |
+| `signing_key`            | no       | Path to a PEM-encoded ECDSA private key used to sign registry-issued tokens. If omitted, an ephemeral key is generated at startup — tokens will be invalidated on restart, but clients re-authenticate automatically. For multi-replica deployments, provide a stable key. Generate with: `openssl ecparam -name prime256v1 -genkey -noout -out token-signing.pem`. When configured, the file is polled every `policy_reload_interval` and hot-reloaded on change without a restart. |
 | `token_expiry`           | no       | Lifetime of registry-issued tokens. Defaults to `5m`. |
 | `token_issuer`           | no       | The `iss` claim value in registry-issued tokens. Defaults to the value of `service`. |
 | `policies`               | no       | List of inline CEL policy rules (used when `policy_file` is not set). |

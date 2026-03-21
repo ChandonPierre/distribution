@@ -183,7 +183,15 @@ The token endpoint signs registry JWTs with an ECDSA P-256 key (`ES256`). This c
 - **Configured** (`signing_key: /path/to/key.pem`): a PEM-encoded EC private key (SEC 1 format) or PKCS#8 key. Use this in production or when running multiple registry replicas (all replicas must share the same key so tokens issued by one replica are accepted by another).
 - **Ephemeral** (no `signing_key`): an ECDSA P-256 key pair is generated at startup. A warning is logged. Tokens are invalidated on restart and cannot be verified across replicas.
 
-The public half of the signing key is stored on `accessController.localSigningKey` and used by the `authorizeRegistryToken()` path.
+The current key pair is stored in `accessController.signingKey` as an `atomic.Pointer[signingKeyState]` shared with `tokenEndpointHandler`. Both signing (token issuance) and verification (`authorizeRegistryToken`) always read from this atomic, so they stay in sync.
+
+#### Signing key hot reload
+
+When `signing_key` is configured, a background goroutine polls the file every `policy_reload_interval` (default 30s) using the same SHA-256 change-detection pattern as the policy reloader. On a detected change, a new `signingKeyState` (private key + public key) is atomically stored. In-flight token verifications complete with the previous key; new issuances use the new key immediately.
+
+On error (unreadable file, invalid PEM, wrong curve), a warning is logged and the previous key remains active.
+
+This enables short-lived certificates to be used as the signing key — the registry picks up rotations without a restart. Note that tokens already issued before a rotation will fail verification once the key is replaced. Keep `token_expiry` short (≤ 2m) to bound the impact window, or retain the previous public key for verification (not currently implemented).
 
 A note on `REGISTRY_HTTP_SECRET`: that environment variable is used to sign state cookies for the OAuth2 flow — it is not used for JWT signing and serves a different purpose.
 
@@ -225,7 +233,7 @@ auth:
     jwks_refresh_interval: 1h        # How often to refresh JWKS in background (default: 1h)
 
     # Token endpoint
-    signing_key: /etc/registry/token-signing.pem  # PEM ECDSA private key; omit for ephemeral
+    signing_key: /etc/registry/token-signing.pem  # PEM ECDSA private key; omit for ephemeral; hot-reloaded on change
     token_expiry: 5m                               # Registry JWT lifetime (default: 5m)
     token_issuer: registry.example.com             # `iss` in registry JWTs (default: service)
 
