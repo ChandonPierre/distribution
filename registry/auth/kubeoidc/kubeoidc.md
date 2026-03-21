@@ -102,9 +102,19 @@ A `refreshing` boolean prevents goroutine storms when many requests arrive simul
 
 #### Trusted issuers allowlist
 
-The `trustedIssuers` map is checked before any network call. An unknown issuer is rejected immediately. This prevents:
+The trusted issuer check is performed before any network call. An unknown issuer is rejected immediately. This prevents:
 - Accidental SSRF via attacker-controlled `iss` claims
 - OIDC discovery requests to arbitrary URLs
+
+Entries in `issuers` may be exact URLs or prefix patterns ending in `*`:
+
+```yaml
+issuers:
+  - https://kubernetes.default.svc                 # exact
+  - https://oidc.example.com/id/*                  # matches any tenant under this path
+```
+
+Prefix patterns are stored without the trailing `*` and matched with `strings.HasPrefix`. Each matching issuer URL still gets its own JWKS cache — discovery is done per concrete issuer, not per pattern.
 
 ### CEL Policy Engine (`policy.go`)
 
@@ -224,8 +234,8 @@ auth:
     # Required
     realm: https://registry.example.com/auth/token  # Token endpoint URL (returned in WWW-Authenticate)
     issuers:                                          # Trusted OIDC issuer URLs (from JWT `iss`)
-      - https://kubernetes.default.svc
-      - https://oidc.eks.us-east-1.amazonaws.com/id/EXAMPLE
+      - https://kubernetes.default.svc               # exact match
+      - https://oidc.example.com/id/*                # prefix match — trusts any tenant under this path
 
     # Optional
     service: registry.example.com    # Expected JWT `aud` value; if omitted, aud check is skipped
@@ -273,9 +283,11 @@ Registry-issued tokens are verified against a local ECDSA key. With a persistent
 
 ### Issuer confusion
 
-The `trustedIssuers` list is checked against the token's `iss` claim before any OIDC/JWKS lookup. This prevents:
+The `issuers` allowlist is checked against the token's `iss` claim before any OIDC/JWKS lookup. This prevents:
 - An attacker controlling an OIDC-compliant server from issuing tokens that appear valid.
 - SSRF via a crafted `iss` claim pointing to an internal service.
+
+When using prefix patterns (`https://oidc.example.com/id/*`), ensure the prefix is specific enough that no attacker-controlled issuer could match it.
 
 ### Token scope
 

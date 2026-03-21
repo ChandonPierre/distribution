@@ -4,7 +4,6 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
-	"slices"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -187,16 +186,15 @@ func newAccessController(options map[string]any) (auth.AccessController, error) 
 		tokenIssuer = cfg.Service
 	}
 
-	// Prevent routing collisions: if tokenIssuer matches a trusted OIDC issuer,
-	// SA tokens from that issuer would be incorrectly routed to the registry-JWT
-	// validation path (authorizeRegistryToken) and fail with ErrInvalidToken
-	// because they aren't signed by the local key.
-	if tokenIssuer != "" && slices.Contains(cfg.Issuers, tokenIssuer) {
-		return nil, fmt.Errorf("kubeoidc: token_issuer %q conflicts with a trusted OIDC issuer; use a distinct value (e.g. the registry hostname)", tokenIssuer)
-	}
-
 	httpClient := newHTTPClient(cfg.InsecureSkipTLSVerify)
 	issuerCache := newIssuerCacheMap(cfg.Issuers, refreshInterval, httpClient)
+
+	// Prevent routing collisions: if tokenIssuer matches a trusted OIDC issuer
+	// (exactly or via a wildcard prefix), SA tokens from that issuer would be
+	// incorrectly routed to the registry-JWT validation path and fail.
+	if tokenIssuer != "" && issuerCache.isTrusted(tokenIssuer) {
+		return nil, fmt.Errorf("kubeoidc: token_issuer %q conflicts with a trusted OIDC issuer; use a distinct value (e.g. the registry hostname)", tokenIssuer)
+	}
 
 	celEnv, err := newCELEnv()
 	if err != nil {

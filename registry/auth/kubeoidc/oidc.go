@@ -39,33 +39,56 @@ type jwksCache struct {
 }
 
 // issuerCacheMap manages per-issuer JWKS caches.
+// Trusted issuers may be exact URLs or prefix patterns ending in "*"
+// (e.g. "https://oidc.example.com/id/*" matches any issuer under that path).
 type issuerCacheMap struct {
-	mu             sync.RWMutex
-	caches         map[string]*jwksCache
-	trustedIssuers map[string]bool
-	refreshEvery   time.Duration
-	httpClient     *http.Client
+	mu            sync.RWMutex
+	caches        map[string]*jwksCache
+	exactIssuers  map[string]bool
+	prefixIssuers []string // stored without the trailing "*"
+	refreshEvery  time.Duration
+	httpClient    *http.Client
 }
 
 // newIssuerCacheMap creates a new issuerCacheMap with the given trusted issuers.
+// Entries ending in "*" are treated as prefix patterns; all others are exact matches.
 // Caches are lazily populated on first use.
 func newIssuerCacheMap(trustedIssuers []string, refresh time.Duration, client *http.Client) *issuerCacheMap {
-	trusted := make(map[string]bool, len(trustedIssuers))
+	exact := make(map[string]bool, len(trustedIssuers))
+	var prefixes []string
 	for _, iss := range trustedIssuers {
-		trusted[iss] = true
+		if strings.HasSuffix(iss, "*") {
+			prefixes = append(prefixes, strings.TrimSuffix(iss, "*"))
+		} else {
+			exact[iss] = true
+		}
 	}
 	return &issuerCacheMap{
-		caches:         make(map[string]*jwksCache),
-		trustedIssuers: trusted,
-		refreshEvery:   refresh,
-		httpClient:     client,
+		caches:        make(map[string]*jwksCache),
+		exactIssuers:  exact,
+		prefixIssuers: prefixes,
+		refreshEvery:  refresh,
+		httpClient:    client,
 	}
 }
 
+// isTrusted reports whether issuer is covered by the configured exact or prefix entries.
+func (m *issuerCacheMap) isTrusted(issuer string) bool {
+	if m.exactIssuers[issuer] {
+		return true
+	}
+	for _, p := range m.prefixIssuers {
+		if strings.HasPrefix(issuer, p) {
+			return true
+		}
+	}
+	return false
+}
+
 // getCache returns the JWKS cache for the given issuer, initializing it lazily if needed.
-// Returns an error if the issuer is not in the trusted list.
+// Returns an error if the issuer is not covered by the trusted list.
 func (m *issuerCacheMap) getCache(issuer string) (*jwksCache, error) {
-	if !m.trustedIssuers[issuer] {
+	if !m.isTrusted(issuer) {
 		return nil, fmt.Errorf("kubeoidc: issuer %q is not in the trusted issuers list", issuer)
 	}
 
