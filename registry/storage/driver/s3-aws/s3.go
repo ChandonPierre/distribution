@@ -65,6 +65,12 @@ const (
 	// above which multipart copy will be used. (PUT Object - Copy is used
 	// for objects at or below this size.)  Empirically, 32 MB is optimal.
 	defaultMultipartCopyThresholdSize = 32 * 1024 * 1024
+
+	// defaultMaxConnections is the default size of the HTTP connection pool
+	// (MaxIdleConns and MaxIdleConnsPerHost on the underlying transport).
+	// Go's http.DefaultTransport keeps at most 2 idle connections per host,
+	// which causes excessive connection churn under concurrent S3 load.
+	defaultMaxConnections = 10
 )
 
 // listMax is the largest amount of objects you can request from S3 in a list call
@@ -119,6 +125,7 @@ type DriverParameters struct {
 	UseFIPSEndpoint             bool
 	LogLevel                    aws.LogLevelType
 	RedirectEndpoint            string
+	MaxConnections              int
 }
 
 func init() {
@@ -274,6 +281,11 @@ func FromParameters(ctx context.Context, parameters map[string]any) (*Driver, er
 		return nil, err
 	}
 
+	maxConnections, err := getParameterAsInteger(parameters, "maxconnections", defaultMaxConnections, 1, math.MaxInt)
+	if err != nil {
+		return nil, err
+	}
+
 	rootDirectory := parameters["rootdirectory"]
 	if rootDirectory == nil {
 		rootDirectory = ""
@@ -369,6 +381,7 @@ func FromParameters(ctx context.Context, parameters map[string]any) (*Driver, er
 		UseFIPSEndpoint:             useFIPSEndpointBool,
 		LogLevel:                    getS3LogLevelFromParam(parameters["loglevel"]),
 		RedirectEndpoint:            fmt.Sprint(redirectEndpoint),
+		MaxConnections:              maxConnections,
 	}
 
 	return New(ctx, params)
@@ -490,13 +503,23 @@ func New(ctx context.Context, params DriverParameters) (*Driver, error) {
 		awsConfig.UseFIPSEndpoint = endpoints.FIPSEndpointStateEnabled
 	}
 
+	// Always build a custom transport so we can tune the connection pool.
+	// Clone http.DefaultTransport to preserve sensible defaults (dial
+	// context, TLS timeouts, compression, etc.) and override only what we
+	// care about.
+	//
+	// Go's http.DefaultTransport keeps at most 2 idle connections per host
+	// (DefaultMaxIdleConnsPerHost). Under concurrent S3 load this causes
+	// constant connection churn: new TLS handshakes on every request once
+	// the 2-slot idle pool is exhausted. Setting MaxIdleConnsPerHost to
+	// match MaxConnections keeps a full pool of warm connections available.
+	httpTransport := http.DefaultTransport.(*http.Transport).Clone()
+	httpTransport.MaxIdleConns = params.MaxConnections
+	httpTransport.MaxIdleConnsPerHost = params.MaxConnections
 	if params.SkipVerify {
-		httpTransport := http.DefaultTransport.(*http.Transport).Clone()
-		httpTransport.TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
-		awsConfig.WithHTTPClient(&http.Client{
-			Transport: httpTransport,
-		})
+		httpTransport.TLSClientConfig = &tls.Config{InsecureSkipVerify: true} //nolint:gosec
 	}
+	awsConfig.WithHTTPClient(&http.Client{Transport: httpTransport})
 
 	sess, err := session.NewSession(awsConfig)
 	if err != nil {
