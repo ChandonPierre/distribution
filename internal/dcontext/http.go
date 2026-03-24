@@ -5,7 +5,7 @@ import (
 	"errors"
 	"net/http"
 	"strings"
-	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/distribution/distribution/v3/internal/requestutil"
@@ -195,33 +195,21 @@ type instrumentedResponseWriter struct {
 	http.ResponseWriter
 	context.Context
 
-	mu      sync.Mutex
-	status  int
-	written int64
+	status  atomic.Int32
+	written atomic.Int64
 }
 
 func (irw *instrumentedResponseWriter) Write(p []byte) (n int, err error) {
 	n, err = irw.ResponseWriter.Write(p)
-
-	irw.mu.Lock()
-	irw.written += int64(n)
-
+	irw.written.Add(int64(n))
 	// Guess the likely status if not set.
-	if irw.status == 0 {
-		irw.status = http.StatusOK
-	}
-
-	irw.mu.Unlock()
-
+	irw.status.CompareAndSwap(0, http.StatusOK)
 	return
 }
 
 func (irw *instrumentedResponseWriter) WriteHeader(status int) {
 	irw.ResponseWriter.WriteHeader(status)
-
-	irw.mu.Lock()
-	irw.status = status
-	irw.mu.Unlock()
+	irw.status.Store(int32(status))
 }
 
 func (irw *instrumentedResponseWriter) Flush() {
@@ -236,13 +224,9 @@ func (irw *instrumentedResponseWriter) Value(key any) any {
 		case "http.response":
 			return irw
 		case "http.response.written":
-			irw.mu.Lock()
-			defer irw.mu.Unlock()
-			return irw.written
+			return irw.written.Load()
 		case "http.response.status":
-			irw.mu.Lock()
-			defer irw.mu.Unlock()
-			return irw.status
+			return int(irw.status.Load())
 		case "http.response.contenttype":
 			if ct := irw.Header().Get("Content-Type"); ct != "" {
 				return ct
