@@ -140,13 +140,21 @@ func (ttles *TTLExpirationScheduler) Start() error {
 					ttles.Unlock()
 					continue
 				}
+				// Marshal under lock, then release before the S3 write so that
+				// AddBlob/AddManifest calls are not blocked during storage I/O.
+				jsonBytes, err := json.Marshal(ttles.entries)
+				ttles.Unlock()
 
-				err := ttles.writeState()
 				if err != nil {
-					dcontext.GetLogger(ttles.ctx).Errorf("Error writing scheduler state: %s", err)
-				} else {
-					ttles.indexDirty = false
+					dcontext.GetLogger(ttles.ctx).Errorf("Error marshaling scheduler state: %s", err)
+					continue
 				}
+				if err := ttles.driver.PutContent(ttles.ctx, ttles.pathToStateFile, jsonBytes); err != nil {
+					dcontext.GetLogger(ttles.ctx).Errorf("Error writing scheduler state: %s", err)
+					continue
+				}
+				ttles.Lock()
+				ttles.indexDirty = false
 				ttles.Unlock()
 
 			case <-ttles.doneChan:
