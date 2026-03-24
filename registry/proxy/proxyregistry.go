@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/distribution/reference"
+	"github.com/opencontainers/go-digest"
 
 	"github.com/distribution/distribution/v3"
 	"github.com/distribution/distribution/v3/configuration"
@@ -206,6 +207,7 @@ func (pr *proxyingRegistry) Repository(ctx context.Context, name reference.Named
 			cacheWriteTimeout: pr.cacheWriteTimeout,
 			repositoryName:    name,
 			authChallenger:    pr.authChallenger,
+			inflight:          make(map[digest.Digest]struct{}),
 		},
 		manifests: &proxyManifestStore{
 			repositoryName:  name,
