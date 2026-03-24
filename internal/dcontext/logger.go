@@ -114,25 +114,31 @@ func getLogrusLogger(ctx context.Context, keys ...any) *logrus.Entry {
 	}
 
 	if logger == nil {
-		fields := logrus.Fields{}
-
-		// Fill in the instance id, if we have it.
 		instanceID := ctx.Value("instance.id")
-		if instanceID != nil {
-			fields["instance.id"] = instanceID
-		}
-
 		defaultLoggerMu.RLock()
-		logger = defaultLogger.WithFields(fields)
+		dl := defaultLogger
 		defaultLoggerMu.RUnlock()
+		if instanceID != nil {
+			logger = dl.WithField("instance.id", instanceID)
+		} else {
+			logger = dl
+		}
 	}
 
-	fields := logrus.Fields{}
+	if len(keys) == 0 {
+		return logger
+	}
+
+	fields := make(logrus.Fields, len(keys))
 	for _, key := range keys {
 		v := ctx.Value(key)
 		if v != nil {
 			fields[fmt.Sprint(key)] = v
 		}
+	}
+
+	if len(fields) == 0 {
+		return logger
 	}
 
 	return logger.WithFields(fields)
