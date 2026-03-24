@@ -25,15 +25,13 @@ type proxyBlobStore struct {
 	cacheWriteTimeout time.Duration
 	repositoryName    reference.Named
 	authChallenger    authChallenger
+
+	// mu protects inflight. Per-instance so repositories don't contend with each other.
+	mu       sync.Mutex
+	inflight map[digest.Digest]struct{}
 }
 
 var _ distribution.BlobStore = &proxyBlobStore{}
-
-// inflight tracks currently downloading blobs
-var inflight = make(map[digest.Digest]struct{})
-
-// mu protects inflight
-var mu sync.Mutex
 
 func setResponseHeaders(h http.Header, length int64, mediaType string, digest digest.Digest) {
 	h.Set("Content-Length", strconv.FormatInt(length, 10))
@@ -95,23 +93,23 @@ func (pbs *proxyBlobStore) ServeBlob(ctx context.Context, w http.ResponseWriter,
 		return err
 	}
 
-	mu.Lock()
-	_, ok := inflight[dgst]
+	pbs.mu.Lock()
+	_, ok := pbs.inflight[dgst]
 	if ok {
 		// If the blob has been serving in other requests.
 		// Will return the blob from the remote store directly.
 		// TODO Maybe we could reuse the these blobs are serving remotely and caching locally.
-		mu.Unlock()
+		pbs.mu.Unlock()
 		_, err := pbs.copyContent(ctx, dgst, w, w.Header())
 		return err
 	}
-	inflight[dgst] = struct{}{}
-	mu.Unlock()
+	pbs.inflight[dgst] = struct{}{}
+	pbs.mu.Unlock()
 
 	defer func() {
-		mu.Lock()
-		delete(inflight, dgst)
-		mu.Unlock()
+		pbs.mu.Lock()
+		delete(pbs.inflight, dgst)
+		pbs.mu.Unlock()
 	}()
 
 	// Create a detached context for the blob writer that won't be canceled
