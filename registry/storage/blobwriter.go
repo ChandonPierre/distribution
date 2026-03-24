@@ -291,6 +291,11 @@ func (bw *blobWriter) validateBlob(ctx context.Context, desc v1.Descriptor) (v1.
 // moveBlob moves the data into its final, hash-qualified destination,
 // identified by dgst. The layer should be validated before commencing the
 // move.
+//
+// A singleflight group is used to ensure that at most one in-process goroutine
+// performs the actual storage Move for any given digest at a time. Concurrent
+// callers with the same digest wait for the in-flight operation and share its
+// result, avoiding redundant (and expensive) object-storage copy+delete cycles.
 func (bw *blobWriter) moveBlob(ctx context.Context, desc v1.Descriptor) error {
 	blobPath, err := pathFor(blobDataPathSpec{
 		digest: desc.Digest,
@@ -299,60 +304,63 @@ func (bw *blobWriter) moveBlob(ctx context.Context, desc v1.Descriptor) error {
 		return err
 	}
 
-	// Check for existence
-	if _, err := bw.blobStore.driver.Stat(ctx, blobPath); err != nil {
-		switch err := err.(type) {
-		case storagedriver.PathNotFoundError:
-			break // ensure that it doesn't exist.
-		default:
-			return err
-		}
-	} else {
-		// If the path exists, we can assume that the content has already
-		// been uploaded, since the blob storage is content-addressable.
-		// While it may be corrupted, detection of such corruption belongs
-		// elsewhere.
-		return nil
-	}
-
-	// If no data was received, we may not actually have a file on disk. Check
-	// the size here and write a zero-length file to blobPath if this is the
-	// case. For the most part, this should only ever happen with zero-length
-	// blobs.
-	if _, err := bw.blobStore.driver.Stat(ctx, bw.path); err != nil {
-		switch err := err.(type) {
-		case storagedriver.PathNotFoundError:
-			// HACK(stevvooe): This is slightly dangerous: if we verify above,
-			// get a hash, then the underlying file is deleted, we risk moving
-			// a zero-length blob into a nonzero-length blob location. To
-			// prevent this horrid thing, we employ the hack of only allowing
-			// to this happen for the digest of an empty blob.
-			if desc.Digest == digestSha256Empty {
-				return bw.blobStore.driver.PutContent(ctx, blobPath, []byte{})
+	_, err, _ = bw.blobStore.commitGroup.Do(desc.Digest.String(), func() (any, error) {
+		// Check for existence
+		if _, err := bw.blobStore.driver.Stat(ctx, blobPath); err != nil {
+			switch err.(type) {
+			case storagedriver.PathNotFoundError:
+				break // ensure that it doesn't exist.
+			default:
+				return nil, err
 			}
-
-			// We let this fail during the move below.
-			logrus.
-				WithField("upload.id", bw.ID()).
-				WithField("digest", desc.Digest).Warnf("attempted to move zero-length content with non-zero digest")
-		default:
-			return err // unrelated error
+		} else {
+			// If the path exists, we can assume that the content has already
+			// been uploaded, since the blob storage is content-addressable.
+			// While it may be corrupted, detection of such corruption belongs
+			// elsewhere.
+			return nil, nil
 		}
-	}
 
-	// TODO(stevvooe): We should also write the mediatype when executing this move.
+		// If no data was received, we may not actually have a file on disk. Check
+		// the size here and write a zero-length file to blobPath if this is the
+		// case. For the most part, this should only ever happen with zero-length
+		// blobs.
+		if _, err := bw.blobStore.driver.Stat(ctx, bw.path); err != nil {
+			switch err.(type) {
+			case storagedriver.PathNotFoundError:
+				// HACK(stevvooe): This is slightly dangerous: if we verify above,
+				// get a hash, then the underlying file is deleted, we risk moving
+				// a zero-length blob into a nonzero-length blob location. To
+				// prevent this horrid thing, we employ the hack of only allowing
+				// to this happen for the digest of an empty blob.
+				if desc.Digest == digestSha256Empty {
+					return nil, bw.blobStore.driver.PutContent(ctx, blobPath, []byte{})
+				}
 
-	if err := bw.blobStore.driver.Move(ctx, bw.path, blobPath); err != nil {
-		// A concurrent upload of identical content may have won the race and
-		// already placed the blob at blobPath. Since the store is content-
-		// addressable, the data is guaranteed to be identical, so treat a
-		// post-move existence of the destination as success.
-		if _, statErr := bw.blobStore.driver.Stat(ctx, blobPath); statErr == nil {
-			return nil
+				// We let this fail during the move below.
+				logrus.
+					WithField("upload.id", bw.ID()).
+					WithField("digest", desc.Digest).Warnf("attempted to move zero-length content with non-zero digest")
+			default:
+				return nil, err // unrelated error
+			}
 		}
-		return err
-	}
-	return nil
+
+		// TODO(stevvooe): We should also write the mediatype when executing this move.
+
+		if err := bw.blobStore.driver.Move(ctx, bw.path, blobPath); err != nil {
+			// A concurrent upload of identical content may have won the race and
+			// already placed the blob at blobPath. Since the store is content-
+			// addressable, the data is guaranteed to be identical, so treat a
+			// post-move existence of the destination as success.
+			if _, statErr := bw.blobStore.driver.Stat(ctx, blobPath); statErr == nil {
+				return nil, nil
+			}
+			return nil, err
+		}
+		return nil, nil
+	})
+	return err
 }
 
 // removeResources should clean up all resources associated with the upload
