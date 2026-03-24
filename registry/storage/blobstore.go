@@ -10,6 +10,7 @@ import (
 	"github.com/distribution/distribution/v3/registry/storage/driver"
 	"github.com/opencontainers/go-digest"
 	v1 "github.com/opencontainers/image-spec/specs-go/v1"
+	"golang.org/x/sync/singleflight"
 )
 
 // blobStore implements the read side of the blob store interface over a
@@ -19,6 +20,10 @@ import (
 type blobStore struct {
 	driver  driver.StorageDriver
 	statter distribution.BlobStatter
+
+	// commitGroup deduplicates concurrent moveBlob calls for the same digest.
+	// It is a zero-value-ready type and requires no explicit initialisation.
+	commitGroup singleflight.Group
 }
 
 var _ distribution.BlobProvider = &blobStore{}
