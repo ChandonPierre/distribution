@@ -342,7 +342,17 @@ func (bw *blobWriter) moveBlob(ctx context.Context, desc v1.Descriptor) error {
 
 	// TODO(stevvooe): We should also write the mediatype when executing this move.
 
-	return bw.blobStore.driver.Move(ctx, bw.path, blobPath)
+	if err := bw.blobStore.driver.Move(ctx, bw.path, blobPath); err != nil {
+		// A concurrent upload of identical content may have won the race and
+		// already placed the blob at blobPath. Since the store is content-
+		// addressable, the data is guaranteed to be identical, so treat a
+		// post-move existence of the destination as success.
+		if _, statErr := bw.blobStore.driver.Stat(ctx, blobPath); statErr == nil {
+			return nil
+		}
+		return err
+	}
+	return nil
 }
 
 // removeResources should clean up all resources associated with the upload
