@@ -148,7 +148,7 @@ func (h *tokenEndpointHandler) ServeHTTP(w http.ResponseWriter, r *http.Request)
 
 	cache, err := h.ac.issuerCache.getCache(unverified.Issuer)
 	if err != nil {
-		logrus.Debugf("kubeoidc/token: untrusted issuer %q: %v", unverified.Issuer, err)
+		logrus.Warnf("kubeoidc/token: untrusted issuer %q: %v", unverified.Issuer, err)
 		http.Error(w, "invalid credentials: untrusted issuer", http.StatusUnauthorized)
 		return
 	}

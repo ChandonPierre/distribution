@@ -200,3 +200,117 @@ func TestUntrustedIssuerRejected(t *testing.T) {
 		t.Fatal("expected error for untrusted issuer")
 	}
 }
+
+func TestIsTrusted(t *testing.T) {
+	issuers := []string{
+		"https://exact.example.com",
+		"https://oidc.example.com/id/*",
+		"https://oidc-staging.cks.coreweave.com/id/*",
+	}
+	client := &http.Client{Timeout: 5 * time.Second}
+	m := newIssuerCacheMap(issuers, time.Hour, client)
+
+	tests := []struct {
+		issuer  string
+		trusted bool
+	}{
+		// Exact match.
+		{"https://exact.example.com", true},
+		// Exact issuer doesn't match a different host.
+		{"https://other.example.com", false},
+		// Prefix match — tenant UUID under the path.
+		{"https://oidc.example.com/id/75d1413a-39ef-42da-aa33-3283236e28de", true},
+		// Prefix match — different UUID same host.
+		{"https://oidc.example.com/id/00000000-0000-0000-0000-000000000000", true},
+		// Wildcard entry itself is not a valid issuer (trailing * stripped, empty suffix would still match prefix).
+		{"https://oidc.example.com/id/", true},
+		// Different host that shares a prefix string shouldn't match.
+		{"https://oidc.example.com.evil.com/id/tenant", false},
+		// Path that doesn't start with the prefix.
+		{"https://oidc.example.com/other/tenant", false},
+		// Staging wildcard matches.
+		{"https://oidc-staging.cks.coreweave.com/id/75d1413a-39ef-42da-aa33-3283236e28de", true},
+		// Staging wildcard does not match prod host.
+		{"https://oidc.cks.coreweave.com/id/75d1413a-39ef-42da-aa33-3283236e28de", false},
+		// Empty issuer is not trusted.
+		{"", false},
+	}
+
+	for _, tt := range tests {
+		got := m.isTrusted(tt.issuer)
+		if got != tt.trusted {
+			t.Errorf("isTrusted(%q) = %v, want %v", tt.issuer, got, tt.trusted)
+		}
+	}
+}
+
+func TestNewIssuerCacheMapSeparatesExactAndPrefix(t *testing.T) {
+	issuers := []string{
+		"https://exact.example.com",
+		"https://prefix.example.com/id/*",
+	}
+	client := &http.Client{Timeout: 5 * time.Second}
+	m := newIssuerCacheMap(issuers, time.Hour, client)
+
+	if !m.exactIssuers["https://exact.example.com"] {
+		t.Error("exact issuer not in exactIssuers map")
+	}
+	if m.exactIssuers["https://prefix.example.com/id/*"] {
+		t.Error("wildcard entry should not be in exactIssuers map")
+	}
+	if len(m.prefixIssuers) != 1 {
+		t.Fatalf("expected 1 prefix, got %d", len(m.prefixIssuers))
+	}
+	if m.prefixIssuers[0] != "https://prefix.example.com/id/" {
+		t.Errorf("prefix stored as %q, want %q", m.prefixIssuers[0], "https://prefix.example.com/id/")
+	}
+}
+
+func TestGetCacheWildcardIssuer(t *testing.T) {
+	// The mock OIDC server's URL is not known at construction time, so we set up
+	// the issuer cache with a prefix derived from a common base URL, then confirm
+	// that getCache succeeds for the concrete tenant issuer.
+	srv, _, baseURL := setupMockOIDCServer(t)
+	_ = srv
+
+	// Simulate a wildcard config: trust any issuer under baseURL + "/id/".
+	wildcard := baseURL + "/id/*"
+	concreteIssuer := baseURL + "/id/some-tenant-uuid"
+
+	// The mock server's discovery endpoint serves the baseURL as issuer, but for
+	// this test we only care that getCache doesn't reject on the trusted-issuer
+	// check. The OIDC discovery will fail (no /id/some-tenant-uuid path) which
+	// is expected — we just want to confirm the trust check passes.
+	client := &http.Client{Timeout: 5 * time.Second}
+	m := newIssuerCacheMap([]string{wildcard}, time.Hour, client)
+
+	if !m.isTrusted(concreteIssuer) {
+		t.Fatalf("isTrusted(%q) = false with wildcard %q", concreteIssuer, wildcard)
+	}
+
+	// getCache will attempt OIDC discovery for the concrete issuer and fail
+	// (no discovery doc at that path), but the error must NOT be "untrusted issuer".
+	_, err := m.getCache(concreteIssuer)
+	if err == nil {
+		t.Fatal("expected OIDC discovery error, got nil")
+	}
+	if err.Error() == "kubeoidc: issuer \""+concreteIssuer+"\" is not in the trusted issuers list" {
+		t.Errorf("getCache returned untrusted-issuer error but issuer should be trusted; got: %v", err)
+	}
+}
+
+func TestGetCacheExactIssuerStillWorks(t *testing.T) {
+	srv, _, issuer := setupMockOIDCServer(t)
+	_ = srv
+
+	client := &http.Client{Timeout: 5 * time.Second}
+	m := newIssuerCacheMap([]string{issuer}, time.Hour, client)
+
+	cache, err := m.getCache(issuer)
+	if err != nil {
+		t.Fatalf("expected no error for exact trusted issuer, got: %v", err)
+	}
+	if cache == nil {
+		t.Fatal("expected non-nil cache")
+	}
+}
