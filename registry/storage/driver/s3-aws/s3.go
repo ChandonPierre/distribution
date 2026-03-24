@@ -1282,11 +1282,29 @@ func (d *driver) getStorageClass() *string {
 	return aws.String(d.StorageClass)
 }
 
+// pendingPart is an UploadPart call dispatched to a background goroutine.
+// Receive from result exactly once to collect the outcome.
+type pendingPart struct {
+	result chan partResult
+}
+
+type partResult struct {
+	part *s3.Part
+	err  error
+}
+
 // writer uploads parts to S3 in a buffered fashion where the length of each
 // part is [writer.driver.ChunkSize], excluding the last part which may be
 // smaller than the configured chunk size and never larger. This allows the
 // multipart upload to be cleanly resumed in future. This is violated if
 // [writer.Close] is called before at least one chunk is written.
+//
+// Parts are uploaded with a single level of pipeline parallelism: while the
+// caller is writing data into the next chunk's buffer, the previous chunk's
+// UploadPart call runs on a background goroutine. This overlaps network I/O
+// and S3 latency with the incoming data stream, improving throughput for
+// large blobs without increasing concurrency or memory usage beyond 2×
+// ChunkSize per writer.
 type writer struct {
 	ctx       context.Context
 	driver    *driver
@@ -1298,6 +1316,10 @@ type writer struct {
 	closed    bool
 	committed bool
 	cancelled bool
+
+	// pending holds the in-flight UploadPart goroutine, if any.
+	// At most one part is in flight at a time.
+	pending *pendingPart
 }
 
 func (d *driver) newWriter(ctx context.Context, key, uploadID string, parts []*s3.Part) storagedriver.FileWriter {
@@ -1434,7 +1456,10 @@ func (w *writer) Close() error {
 
 	defer w.releaseBuffer()
 
-	return w.flush()
+	if err := w.flush(); err != nil {
+		return err
+	}
+	return w.collectPending()
 }
 
 func (w *writer) reset() {
@@ -1472,6 +1497,11 @@ func (w *writer) Commit(ctx context.Context) error {
 	}
 
 	if err := w.flush(); err != nil {
+		return err
+	}
+
+	// Collect the last in-flight part before completing the upload.
+	if err := w.collectPending(); err != nil {
 		return err
 	}
 
@@ -1532,37 +1562,82 @@ func (w *writer) Commit(ctx context.Context) error {
 	return nil
 }
 
-// flush writes at most [w.driver.ChunkSize] of the buffer to S3. flush is only
-// called by [writer.Write] if the buffer is full, and always by [writer.Close]
-// and [writer.Commit].
+// collectPending waits for the in-flight UploadPart goroutine (if any) to
+// complete and appends the resulting part to w.parts. It is a no-op when
+// no upload is in flight.
+func (w *writer) collectPending() error {
+	if w.pending == nil {
+		return nil
+	}
+	res := <-w.pending.result
+	w.pending = nil
+	if res.err != nil {
+		return res.err
+	}
+	w.parts = append(w.parts, res.part)
+	return nil
+}
+
+// flush dispatches at most [w.driver.ChunkSize] bytes from the buffer as an
+// async UploadPart call, after first collecting the result of any previous
+// in-flight part. This provides one level of pipeline parallelism: the caller
+// can continue writing into the buffer while the previous part uploads.
+//
+// Callers that need all parts committed before proceeding (Close, Commit)
+// must call collectPending after flush.
 func (w *writer) flush() error {
+	// Collect the previous async UploadPart result before dispatching the
+	// next one. This enforces at-most-one-in-flight and ensures w.parts is
+	// updated before we derive the next part number.
+	if err := w.collectPending(); err != nil {
+		return err
+	}
+
 	if w.buf.Len() == 0 {
 		return nil
 	}
 
-	r := bytes.NewReader(w.buf.Next(w.driver.ChunkSize))
+	// Copy at most ChunkSize bytes into a separate pool buffer. This is
+	// required because the goroutine and the main writer must not share the
+	// same backing array: bytes.Buffer may compact its internal storage on
+	// subsequent writes, overwriting memory the goroutine is still reading.
+	partBuf := w.driver.pool.Get().(*bytes.Buffer)
+	partBuf.Write(w.buf.Next(w.driver.ChunkSize))
 
-	partSize := r.Len()
+	partSize := int64(partBuf.Len())
 	partNumber := aws.Int64(int64(len(w.parts)) + 1)
 
-	resp, err := w.driver.S3.UploadPartWithContext(w.ctx, &s3.UploadPartInput{
-		Bucket:     aws.String(w.driver.Bucket),
-		Key:        aws.String(w.key),
-		PartNumber: partNumber,
-		UploadId:   aws.String(w.uploadID),
-		Body:       r,
-	})
-	if err != nil {
-		return fmt.Errorf("upload part: %w", err)
-	}
+	// Advance size immediately so Size() stays accurate while the part is
+	// uploading in the background.
+	w.size += partSize
 
-	w.parts = append(w.parts, &s3.Part{
-		ETag:       resp.ETag,
-		PartNumber: partNumber,
-		Size:       aws.Int64(int64(partSize)),
-	})
+	ch := make(chan partResult, 1)
+	w.pending = &pendingPart{result: ch}
 
-	w.size += int64(partSize)
+	go func() {
+		defer func() {
+			partBuf.Reset()
+			w.driver.pool.Put(partBuf)
+		}()
+		resp, err := w.driver.S3.UploadPartWithContext(w.ctx, &s3.UploadPartInput{
+			Bucket:     aws.String(w.driver.Bucket),
+			Key:        aws.String(w.key),
+			PartNumber: partNumber,
+			UploadId:   aws.String(w.uploadID),
+			Body:       bytes.NewReader(partBuf.Bytes()),
+		})
+		if err != nil {
+			ch <- partResult{err: fmt.Errorf("upload part: %w", err)}
+			return
+		}
+		ch <- partResult{
+			part: &s3.Part{
+				ETag:       resp.ETag,
+				PartNumber: partNumber,
+				Size:       aws.Int64(partSize),
+			},
+		}
+	}()
 
 	return nil
 }
