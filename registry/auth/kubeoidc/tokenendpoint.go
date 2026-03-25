@@ -127,67 +127,71 @@ func (h *tokenEndpointHandler) ServeHTTP(w http.ResponseWriter, r *http.Request)
 	// --- Extract credentials ---
 	// Docker sends Basic auth where username = docker login username and
 	// password = the Kubernetes service account JWT.
+	// An anonymous request (no credentials or empty password) is allowed through
+	// so that policies without token checks (e.g. public pull) can still match.
 	username, password, ok := r.BasicAuth()
-	if !ok || password == "" {
-		w.Header().Set("WWW-Authenticate", fmt.Sprintf("Basic realm=%q", service))
-		http.Error(w, "basic auth required", http.StatusUnauthorized)
+	if !ok && r.Header.Get("Authorization") != "" {
+		// Authorization header present but malformed (not valid Basic auth).
+		http.Error(w, "invalid credentials: malformed authorization header", http.StatusUnauthorized)
 		return
 	}
 
-	// --- Validate the SA token (password) ---
-	parsedToken, err := josejwt.ParseSigned(password, defaultSigningAlgorithms)
-	if err != nil {
-		http.Error(w, "invalid credentials: malformed token", http.StatusUnauthorized)
-		return
-	}
-	var unverified josejwt.Claims
-	if err := parsedToken.UnsafeClaimsWithoutVerification(&unverified); err != nil {
-		http.Error(w, "invalid credentials: cannot read token claims", http.StatusUnauthorized)
-		return
-	}
-
-	cache, err := h.ac.issuerCache.getCache(unverified.Issuer)
-	if err != nil {
-		logrus.Warnf("kubeoidc/token: untrusted issuer %q: %v", unverified.Issuer, err)
-		http.Error(w, "invalid credentials: untrusted issuer", http.StatusUnauthorized)
-		return
-	}
-
-	keySet := cache.getKeys()
-	var verified josejwt.Claims
-	verifyErr := tryVerifyKeys(parsedToken, keySet, &verified)
-	if verifyErr != nil {
-		// Unknown kid? Try a sync refresh once.
-		if syncErr := cache.syncRefresh(); syncErr != nil {
-			logrus.Warnf("kubeoidc/token: sync JWKS refresh failed: %v", syncErr)
-		}
-		keySet = cache.getKeys()
-		verifyErr = tryVerifyKeys(parsedToken, keySet, &verified)
-	}
-	if verifyErr != nil {
-		http.Error(w, "invalid credentials: token verification failed", http.StatusUnauthorized)
-		return
-	}
-
-	expected := josejwt.Expected{
-		Issuer: unverified.Issuer,
-	}
-	if h.ac.service != "" {
-		expected.AnyAudience = josejwt.Audience{h.ac.service}
-	}
-	if err := verified.ValidateWithLeeway(expected, 60*time.Second); err != nil {
-		http.Error(w, "invalid credentials: token validation failed", http.StatusUnauthorized)
-		return
-	}
-
-	// Build the CEL token map from the full raw payload.
+	// Build the CEL token map from credentials, or leave nil for anonymous requests.
 	var tokenMap map[string]any
-	if err := parsedToken.UnsafeClaimsWithoutVerification(&tokenMap); err != nil {
-		http.Error(w, "invalid credentials: cannot read token claims", http.StatusUnauthorized)
-		return
-	}
-	if raw, ok := tokenMap["aud"]; ok {
-		tokenMap["aud"] = toStringSlice(raw)
+	if password != "" {
+		// --- Validate the SA token (password) ---
+		parsedToken, err := josejwt.ParseSigned(password, defaultSigningAlgorithms)
+		if err != nil {
+			http.Error(w, "invalid credentials: malformed token", http.StatusUnauthorized)
+			return
+		}
+		var unverified josejwt.Claims
+		if err := parsedToken.UnsafeClaimsWithoutVerification(&unverified); err != nil {
+			http.Error(w, "invalid credentials: cannot read token claims", http.StatusUnauthorized)
+			return
+		}
+
+		cache, err := h.ac.issuerCache.getCache(unverified.Issuer)
+		if err != nil {
+			logrus.Warnf("kubeoidc/token: untrusted issuer %q: %v", unverified.Issuer, err)
+			http.Error(w, "invalid credentials: untrusted issuer", http.StatusUnauthorized)
+			return
+		}
+
+		keySet := cache.getKeys()
+		var verified josejwt.Claims
+		verifyErr := tryVerifyKeys(parsedToken, keySet, &verified)
+		if verifyErr != nil {
+			// Unknown kid? Try a sync refresh once.
+			if syncErr := cache.syncRefresh(); syncErr != nil {
+				logrus.Warnf("kubeoidc/token: sync JWKS refresh failed: %v", syncErr)
+			}
+			keySet = cache.getKeys()
+			verifyErr = tryVerifyKeys(parsedToken, keySet, &verified)
+		}
+		if verifyErr != nil {
+			http.Error(w, "invalid credentials: token verification failed", http.StatusUnauthorized)
+			return
+		}
+
+		expected := josejwt.Expected{
+			Issuer: unverified.Issuer,
+		}
+		if h.ac.service != "" {
+			expected.AnyAudience = josejwt.Audience{h.ac.service}
+		}
+		if err := verified.ValidateWithLeeway(expected, 60*time.Second); err != nil {
+			http.Error(w, "invalid credentials: token validation failed", http.StatusUnauthorized)
+			return
+		}
+
+		if err := parsedToken.UnsafeClaimsWithoutVerification(&tokenMap); err != nil {
+			http.Error(w, "invalid credentials: cannot read token claims", http.StatusUnauthorized)
+			return
+		}
+		if raw, ok := tokenMap["aud"]; ok {
+			tokenMap["aud"] = toStringSlice(raw)
+		}
 	}
 
 	ps := h.ac.policySet.Load()
@@ -207,7 +211,12 @@ func (h *tokenEndpointHandler) ServeHTTP(w http.ResponseWriter, r *http.Request)
 
 	// --- Issue the registry JWT ---
 	now := time.Now()
-	sub := verified.Subject
+	var sub string
+	if tokenMap != nil {
+		if s, ok := tokenMap["sub"].(string); ok {
+			sub = s
+		}
+	}
 	if sub == "" {
 		sub = username
 	}

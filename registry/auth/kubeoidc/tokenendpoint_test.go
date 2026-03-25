@@ -137,10 +137,58 @@ func TestTokenEndpointMissingCredentials(t *testing.T) {
 	_, state := newTestServer(t)
 	ctrl := newTestControllerWithOptions(t, state, nil, nil)
 
-	// No credentials at all.
+	// No credentials, no matching anonymous policy: token endpoint returns 200
+	// with an empty access list (scope denied) rather than 401, so that Docker
+	// clients can distinguish "unauthenticated but allowed to try" from
+	// "server requires credentials".
 	rw := callTokenEndpoint(t, ctrl, "", "", []string{"repository:myimage:pull"})
-	if rw.Code != http.StatusUnauthorized {
-		t.Errorf("expected 401, got %d", rw.Code)
+	if rw.Code != http.StatusOK {
+		t.Errorf("expected 200, got %d", rw.Code)
+	}
+	var resp map[string]any
+	if err := json.NewDecoder(rw.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	// Token should be issued but with no access granted.
+	if _, ok := resp["token"]; !ok {
+		t.Error("expected token in response")
+	}
+}
+
+func TestTokenEndpointAnonymousGranted(t *testing.T) {
+	_, state := newTestServer(t)
+	policies := []policyConfig{
+		{
+			Name: "anon-pull",
+			Expression: `request["type"] == "repository" &&
+request["repository"] == "publicimg" &&
+"pull" in request["actions"]`,
+		},
+	}
+	ctrl := newTestControllerWithOptions(t, state, policies, nil)
+
+	// Anonymous request matching the policy should receive a token with pull access.
+	rw := callTokenEndpoint(t, ctrl, "", "", []string{"repository:publicimg:pull"})
+	if rw.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rw.Code, rw.Body.String())
+	}
+	var resp tokenResponse
+	if err := json.Unmarshal(rw.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal response: %v", err)
+	}
+	var claims registryClaims
+	parsedToken, err := jwt.ParseSigned(resp.Token, defaultSigningAlgorithms)
+	if err != nil {
+		t.Fatalf("parse issued token: %v", err)
+	}
+	if err := parsedToken.Claims(ctrl.signingKey.Load().publicKey, &claims); err != nil {
+		t.Fatalf("claims: %v", err)
+	}
+	if len(claims.Access) != 1 || claims.Access[0].Name != "publicimg" {
+		t.Fatalf("expected access to publicimg, got %v", claims.Access)
+	}
+	if len(claims.Access[0].Actions) != 1 || claims.Access[0].Actions[0] != "pull" {
+		t.Errorf("expected only pull, got %v", claims.Access[0].Actions)
 	}
 }
 
