@@ -164,10 +164,20 @@ export async function getCatalog(
   creds: Credentials | null,
   tokenCache: Map<string, string>,
 ): Promise<string[]> {
-  const res = await fetchRegistry('/v2/_catalog?n=1000', 'GET', creds, tokenCache);
-  if (!res.ok) throw new Error(`getCatalog failed: ${res.status}`);
-  const body = await res.json() as { repositories: string[] };
-  return body.repositories ?? [];
+  const all: string[] = [];
+  let url = '/v2/_catalog?n=1000';
+  while (url) {
+    const res = await fetchRegistry(url, 'GET', creds, tokenCache);
+    if (!res.ok) throw new Error(`getCatalog failed: ${res.status}`);
+    const body = await res.json() as { repositories: string[] | null };
+    const page = body.repositories ?? [];
+    all.push(...page);
+    // Follow RFC 5988 Link header: Link: </v2/_catalog?last=x&n=1000>; rel="next"
+    const link = res.headers.get('Link') ?? '';
+    const next = link.match(/<([^>]+)>;\s*rel="next"/);
+    url = next ? next[1] : '';
+  }
+  return all;
 }
 
 export async function getTags(
