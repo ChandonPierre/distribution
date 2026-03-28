@@ -127,14 +127,26 @@ func (h *tokenEndpointHandler) ServeHTTP(w http.ResponseWriter, r *http.Request)
 	// --- Extract credentials ---
 	// Docker sends Basic auth where username = docker login username and
 	// password = the Kubernetes service account JWT.
-	// An anonymous request (no credentials or empty password) is allowed through
-	// so that policies without token checks (e.g. public pull) can still match.
+	// An anonymous request (no Authorization header) is allowed through so that
+	// policies without token checks (e.g. public pull) can still match.
 	username, password, ok := r.BasicAuth()
 	if !ok && r.Header.Get("Authorization") != "" {
 		// Authorization header present but malformed (not valid Basic auth).
 		http.Error(w, "invalid credentials: malformed authorization header", http.StatusUnauthorized)
 		return
 	}
+	if ok && password == "" {
+		// Credentials supplied but password is empty (e.g. stale/expired imagepullsecret).
+		// Return 401 so the client re-authenticates rather than falling through to the
+		// anonymous path and receiving a zero-access token.
+		w.Header().Set("WWW-Authenticate", fmt.Sprintf("Basic realm=%q", service))
+		http.Error(w, "basic auth required", http.StatusUnauthorized)
+		return
+	}
+
+	// anonymous is true when no Authorization header was sent at all.
+	// Requests with credentials (ok=true, password!="") are never anonymous.
+	anonymous := !ok
 
 	// Build the CEL token map from credentials, or leave nil for anonymous requests.
 	var tokenMap map[string]any
@@ -207,6 +219,16 @@ func (h *tokenEndpointHandler) ServeHTTP(w http.ResponseWriter, r *http.Request)
 			grantedAccess = append(grantedAccess, ra)
 		}
 		// Scopes that are denied are simply omitted from the token (not an error).
+	}
+
+	// When the request was anonymous (no credentials at all) and the policy
+	// evaluation granted nothing, return 401 so that clients with credentials
+	// fall back to retrying with their JWT rather than presenting a zero-access token to the
+	// registry and receiving "insufficient scope".
+	if anonymous && len(grantedAccess) == 0 {
+		w.Header().Set("WWW-Authenticate", fmt.Sprintf("Basic realm=%q", service))
+		http.Error(w, "authorization required", http.StatusUnauthorized)
+		return
 	}
 
 	// --- Issue the registry JWT ---

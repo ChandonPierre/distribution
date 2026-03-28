@@ -137,21 +137,15 @@ func TestTokenEndpointMissingCredentials(t *testing.T) {
 	_, state := newTestServer(t)
 	ctrl := newTestControllerWithOptions(t, state, nil, nil)
 
-	// No credentials, no matching anonymous policy: token endpoint returns 200
-	// with an empty access list (scope denied) rather than 401, so that Docker
-	// clients can distinguish "unauthenticated but allowed to try" from
-	// "server requires credentials".
+	// No credentials, no matching anonymous policy, scope requested: must return
+	// 401 so that clients with imagepullsecrets / credential providers fall back
+	// to retrying with their SA JWT instead of using a zero-access token.
 	rw := callTokenEndpoint(t, ctrl, "", "", []string{"repository:myimage:pull"})
-	if rw.Code != http.StatusOK {
-		t.Errorf("expected 200, got %d", rw.Code)
+	if rw.Code != http.StatusUnauthorized {
+		t.Errorf("expected 401, got %d: %s", rw.Code, rw.Body.String())
 	}
-	var resp map[string]any
-	if err := json.NewDecoder(rw.Body).Decode(&resp); err != nil {
-		t.Fatalf("decode response: %v", err)
-	}
-	// Token should be issued but with no access granted.
-	if _, ok := resp["token"]; !ok {
-		t.Error("expected token in response")
+	if rw.Header().Get("WWW-Authenticate") == "" {
+		t.Error("expected WWW-Authenticate header in response")
 	}
 }
 
@@ -189,6 +183,57 @@ request["repository"] == "publicimg" &&
 	}
 	if len(claims.Access[0].Actions) != 1 || claims.Access[0].Actions[0] != "pull" {
 		t.Errorf("expected only pull, got %v", claims.Access[0].Actions)
+	}
+}
+
+// TestTokenEndpointAnonymousNoGrantFallback is a regression test for the bug
+// introduced in 32b5f9b: Docker/containerd clients first attempt a token fetch
+// without credentials. When no anonymous policy grants the requested scope the
+// token endpoint must return 401 so the client retries with its imagepullsecret
+// / kubelet credential provider SA JWT.  Returning 200 with an empty-access
+// token caused the registry to reply with "insufficient scope" instead.
+func TestTokenEndpointAnonymousNoGrantFallback(t *testing.T) {
+	_, state := newTestServer(t)
+	// Policy requires a valid token — anonymous requests must not match.
+	policies := []policyConfig{
+		{Name: "sa-pull", Expression: `token["sub"] != "" && "pull" in request["actions"]`},
+	}
+	ctrl := newTestControllerWithOptions(t, state, policies, nil)
+
+	// Anonymous request (no Authorization header) must return 401, not 200.
+	rw := callTokenEndpoint(t, ctrl, "", "", []string{"repository:myimage:pull"})
+	if rw.Code != http.StatusUnauthorized {
+		t.Errorf("expected 401 for anonymous+no-grant, got %d: %s", rw.Code, rw.Body.String())
+	}
+	if rw.Header().Get("WWW-Authenticate") == "" {
+		t.Error("expected WWW-Authenticate header so the client can retry with credentials")
+	}
+
+	// Authenticated request with a valid SA token must still succeed.
+	saToken := makeToken(t, state, validClaims(state))
+	rw = callTokenEndpoint(t, ctrl, "user", saToken, []string{"repository:myimage:pull"})
+	if rw.Code != http.StatusOK {
+		t.Fatalf("expected 200 for authenticated request, got %d: %s", rw.Code, rw.Body.String())
+	}
+}
+
+func TestTokenEndpointEmptyPassword(t *testing.T) {
+	// Regression: imagepullsecrets/kubelet credential provider sending Basic auth
+	// with an empty password (stale/expired credentials) must return 401, not a
+	// zero-access token that later produces "insufficient scope" from the registry.
+	_, state := newTestServer(t)
+	ctrl := newTestControllerWithOptions(t, state, nil, nil)
+
+	req := httptest.NewRequest(http.MethodGet, "/auth/token?service="+ctrl.service+"&scope=repository:myimage:pull", nil)
+	req.SetBasicAuth("user", "") // non-empty username, empty password
+	rw := httptest.NewRecorder()
+	ctrl.TokenHandler().ServeHTTP(rw, req)
+
+	if rw.Code != http.StatusUnauthorized {
+		t.Errorf("expected 401, got %d: %s", rw.Code, rw.Body.String())
+	}
+	if rw.Header().Get("WWW-Authenticate") == "" {
+		t.Error("expected WWW-Authenticate header in response")
 	}
 }
 
