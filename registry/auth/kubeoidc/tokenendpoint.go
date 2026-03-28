@@ -213,6 +213,20 @@ func (h *tokenEndpointHandler) ServeHTTP(w http.ResponseWriter, r *http.Request)
 
 	var grantedAccess []resourceActions
 	for _, scope := range scopes {
+		// registry:catalog:* is handled separately: actual access control is
+		// enforced server-side via the catalog_prefixes claim, so we grant the
+		// scope to any authenticated user, and to anonymous users only when at
+		// least one policy provides a catalog prefix (i.e. there are public repos).
+		if scope == "registry:catalog:*" {
+			if !anonymous || len(catalogPrefixesForToken(ps, tokenMap)) > 0 {
+				grantedAccess = append(grantedAccess, resourceActions{
+					Type:    "registry",
+					Name:    "catalog",
+					Actions: []string{"*"},
+				})
+			}
+			continue
+		}
 		ra, granted, err := evaluateScopePolicy(ps, tokenMap, scope)
 		if err != nil {
 			logrus.Warnf("kubeoidc/token: policy error for scope %q: %v", scope, err)
