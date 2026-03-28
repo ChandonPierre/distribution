@@ -370,8 +370,10 @@ func NewApp(ctx context.Context, config *configuration.Configuration) *App {
 	}
 
 	// Serve the compiled React UI under /ui/ only when explicitly enabled.
+	// Use PathPrefix("/ui") (no trailing slash) so the single route matches both
+	// /ui and /ui/... — avoiding a redirect loop with StrictSlash(true).
 	if config.UI.Enabled {
-		app.router.PathPrefix("/ui/").Handler(uiHandler())
+		app.router.PathPrefix("/ui").Handler(uiHandler())
 	}
 
 	return app

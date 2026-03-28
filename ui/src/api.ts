@@ -33,20 +33,22 @@ function parseBearerChallenge(header: string): BearerChallenge | null {
 /**
  * Fetches a token from the token endpoint.
  * scope === '' means no scope (catalog / initial auth).
+ * creds === null means anonymous (no Authorization header sent).
  */
 async function fetchToken(
   realm: string,
   service: string,
   scope: string,
-  creds: Credentials,
+  creds: Credentials | null,
 ): Promise<string> {
   const url = new URL(realm);
   if (service) url.searchParams.set('service', service);
   if (scope) url.searchParams.set('scope', scope);
 
-  const res = await fetch(url.toString(), {
-    headers: { Authorization: basicAuth(creds) },
-  });
+  const headers: Record<string, string> = {};
+  if (creds) headers['Authorization'] = basicAuth(creds);
+
+  const res = await fetch(url.toString(), { headers });
   if (!res.ok) {
     throw new Error(`Token fetch failed: ${res.status} ${res.statusText}`);
   }
@@ -58,11 +60,14 @@ async function fetchToken(
 
 /**
  * Initial login: exchanges credentials for a registry JWT with no scope.
- * Returns the JWT string.
+ * Pass null to attempt an anonymous token (for public access paths).
+ * Returns the JWT string, or '' if the registry requires no auth.
  */
-export async function login(creds: Credentials): Promise<string> {
+export async function login(creds: Credentials | null): Promise<string> {
+  const headers: Record<string, string> = {};
+  if (creds) headers['Authorization'] = basicAuth(creds);
   // First hit /v2/ to get the WWW-Authenticate header pointing at the realm.
-  const res = await fetch('/v2/', { headers: { Authorization: basicAuth(creds) } });
+  const res = await fetch('/v2/', { headers });
 
   if (res.status === 401) {
     const wwwAuth = res.headers.get('WWW-Authenticate') ?? '';
@@ -90,11 +95,12 @@ export async function login(creds: Credentials): Promise<string> {
  * Performs an authenticated fetch against the registry.
  * On 401 it parses the WWW-Authenticate challenge, obtains a scoped token,
  * caches it, and retries once.
+ * creds === null means anonymous — scoped tokens are fetched without credentials.
  */
 export async function fetchRegistry(
   url: string,
   method: string,
-  creds: Credentials,
+  creds: Credentials | null,
   tokenCache: Map<string, string>,
   body?: string,
   extraHeaders?: Record<string, string>,
@@ -155,7 +161,7 @@ function deriveScopeKey(url: string): string {
 // ---------------------------------------------------------------------------
 
 export async function getCatalog(
-  creds: Credentials,
+  creds: Credentials | null,
   tokenCache: Map<string, string>,
 ): Promise<string[]> {
   const res = await fetchRegistry('/v2/_catalog?n=10000', 'GET', creds, tokenCache);
@@ -166,7 +172,7 @@ export async function getCatalog(
 
 export async function getTags(
   repo: string,
-  creds: Credentials,
+  creds: Credentials | null,
   tokenCache: Map<string, string>,
 ): Promise<string[]> {
   const res = await fetchRegistry(`/v2/${repo}/tags/list`, 'GET', creds, tokenCache);
@@ -190,7 +196,7 @@ export interface ManifestResult {
 export async function getManifest(
   repo: string,
   ref: string,
-  creds: Credentials,
+  creds: Credentials | null,
   tokenCache: Map<string, string>,
 ): Promise<ManifestResult> {
   const res = await fetchRegistry(
@@ -210,7 +216,7 @@ export async function getManifest(
 export async function getImageConfig(
   repo: string,
   configDigest: string,
-  creds: Credentials,
+  creds: Credentials | null,
   tokenCache: Map<string, string>,
 ): Promise<ImageConfig> {
   const res = await fetchRegistry(
@@ -226,7 +232,7 @@ export async function getImageConfig(
 export async function deleteManifest(
   repo: string,
   digest: string,
-  creds: Credentials,
+  creds: Credentials | null,
   tokenCache: Map<string, string>,
 ): Promise<void> {
   const res = await fetchRegistry(
@@ -247,7 +253,7 @@ export async function deleteManifest(
 export async function resolveTagInfo(
   repo: string,
   tag: string,
-  creds: Credentials,
+  creds: Credentials | null,
   tokenCache: Map<string, string>,
 ): Promise<TagInfo> {
   const { digest, manifest } = await getManifest(repo, tag, creds, tokenCache);
