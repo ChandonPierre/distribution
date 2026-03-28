@@ -28,11 +28,21 @@ RUN --mount=target=. \
   echo "-X ${PKG}/version.version=${VERSION#v} -X ${PKG}/version.revision=${REVISION} -X ${PKG}/version.mainpkg=${PKG}" | tee /tmp/.ldflags; \
   echo -n "${VERSION}" | tee /tmp/.version;
 
+FROM --platform=$BUILDPLATFORM node:22-alpine AS ui-build
+WORKDIR /src
+COPY ui/package.json ui/package-lock.json ./ui/
+RUN npm ci --prefix ./ui
+COPY ui/ ./ui/
+# vite outDir is ../registry/handlers/ui/dist (relative to ui/), so output lands at
+# /src/registry/handlers/ui/dist inside this stage.
+RUN npm run build --prefix ./ui
+
 FROM base AS build
 ARG TARGETPLATFORM
 ARG LDFLAGS="-s -w"
 ARG BUILDTAGS=""
 RUN --mount=type=bind,target=/src \
+    --mount=type=bind,from=ui-build,source=/src/registry/handlers/ui/dist,target=/src/registry/handlers/ui/dist \
     --mount=type=cache,target=/root/.cache/go-build \
     --mount=target=/go/pkg/mod,type=cache \
     --mount=type=bind,source=/tmp/.ldflags,target=/tmp/.ldflags,from=version \
