@@ -468,6 +468,7 @@ storage:
     rootdirectory: /s3/object/name/prefix
     usefipsendpoint: false
     loglevel: debug
+    maxconnections: 10
   inmemory:
   delete:
     enabled: false
@@ -768,10 +769,12 @@ token claims and the requested repository/action.
 
 Each entry in `policies` has the following fields:
 
-| Field        | Description |
-|--------------|-------------|
-| `name`       | Human-readable name used in log messages. |
-| `expression` | CEL boolean expression. Access is granted if any policy returns `true` (first-match). |
+| Field                       | Description |
+|-----------------------------|-------------|
+| `name`                      | Human-readable name used in log messages. |
+| `expression`                | CEL boolean expression. Access is granted if any policy returns `true` (first-match). |
+| `catalog_prefix`            | Static repository name prefix. When set, the token endpoint probes this policy with the given prefix at token issuance; if access is granted, the prefix is embedded in the registry JWT's `catalog_prefixes` claim and used to filter `/v2/_catalog` responses. |
+| `catalog_prefix_expression` | CEL expression evaluated against the token map that must return a non-empty string. The result is used as the catalog prefix, allowing the tenant namespace to be derived dynamically from a JWT claim (e.g. `token["kubernetes.io/serviceaccount/namespace"]`). Takes precedence over `catalog_prefix` when both are set. |
 
 CEL variables available in each expression:
 
@@ -1345,6 +1348,21 @@ to retrieve the credentials to authenticate with the upstream registry.
 
 > **Note**: These private repositories are stored in the proxy cache's storage.
 > Take appropriate measures to protect access to the proxy cache.
+
+## `ui`
+
+```yaml
+ui:
+  enabled: false
+```
+
+The `ui` section controls the built-in web UI served at `/ui/`. The UI is **disabled by default** and must be explicitly enabled.
+
+| Parameter  | Required | Description |
+|------------|----------|-------------|
+| `enabled`  | no       | Set to `true` to register the `/ui/` route and serve the embedded React application. Defaults to `false`. When `false` (or the section is omitted), the route is not registered and no handler is allocated. |
+
+The UI allows users to browse repositories, inspect tags and manifest details, copy pull commands, and delete tags. Authentication uses the same credentials as `docker login`: a username and OIDC token submitted as Basic auth to the token endpoint. When used with the `kubeoidc` provider, the catalog view is automatically filtered to the repositories the authenticated user is permitted to see (via `catalog_prefixes` in the issued registry JWT).
 
 ## `validation`
 

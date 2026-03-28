@@ -198,6 +198,29 @@ Docker clients (CLI, kubelet, containerd) implement the [Docker Registry Token A
 
 SA tokens do not implement this flow natively — they are issued by the cluster, not the registry. The built-in token endpoint bridges the two worlds: it accepts an SA token as the Basic auth password, validates it, and issues a scoped registry JWT.
 
+#### Anonymous token requests and public access
+
+The token endpoint supports unauthenticated (anonymous) requests to enable policy-based public access. When a client sends a token request with no `Authorization` header, the endpoint evaluates CEL policies with a nil token map. Policies that do not reference `token` at all (e.g. a blanket public-pull rule) can still match:
+
+```yaml
+- name: public-pull
+  expression: |
+    request["type"] == "repository" &&
+    request["repository"].startsWith("public/") &&
+    request["actions"] == ["pull"]
+```
+
+If at least one scope is granted, a valid registry JWT is issued and returned. If no policies grant access to any requested scope, the endpoint returns `401` with a `WWW-Authenticate: Basic` challenge so that clients carrying credentials retry with them. This ensures clients with valid SA tokens are not silently handed a zero-access token.
+
+**Credential edge cases handled by the token endpoint:**
+
+| Condition | Behaviour |
+|---|---|
+| No `Authorization` header | Anonymous path; policies evaluated with nil token. Returns 401 if nothing is granted. |
+| Malformed `Authorization` header (not valid Basic) | `401 invalid credentials` |
+| Valid Basic auth with empty password | `401` with `WWW-Authenticate: Basic` — signals stale/expired imagePullSecret to re-authenticate rather than falling through to anonymous |
+| Valid Basic auth with non-empty password | SA token path; OIDC/JWKS validation runs |
+
 #### Why the registry issues its own JWT rather than reusing the SA token
 
 The most obvious alternative would be to pass the SA token directly as the Bearer token on step 4 above and have `Authorized()` validate it via OIDC/JWKS on every request. This was rejected for several reasons:
