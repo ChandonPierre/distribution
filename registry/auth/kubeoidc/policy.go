@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/google/cel-go/cel"
+	"github.com/google/cel-go/ext"
 	"github.com/sirupsen/logrus"
 	"gopkg.in/yaml.v2"
 )
@@ -38,8 +39,11 @@ type policyFileContent struct {
 }
 
 // newCELEnv creates the shared CEL environment with token and request variables.
+// The ext.Strings() library is included to enable string operations such as
+// substring(), split(), replace(), and lowerAscii() in policy expressions.
 func newCELEnv() (*cel.Env, error) {
 	return cel.NewEnv(
+		ext.Strings(),
 		cel.Variable("token", cel.MapType(cel.StringType, cel.DynType)),
 		cel.Variable("request", cel.MapType(cel.StringType, cel.DynType)),
 	)
