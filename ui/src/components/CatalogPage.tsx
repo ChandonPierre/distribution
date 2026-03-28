@@ -15,7 +15,6 @@ export default function CatalogPage({ onSelectRepo, onLogout }: Props) {
   const [error, setError] = useState<string | null>(null)
 
   useEffect(() => {
-    if (!creds) return
     setLoading(true)
     setError(null)
     getCatalog(creds, tokenCache)
@@ -45,7 +44,7 @@ export default function CatalogPage({ onSelectRepo, onLogout }: Props) {
           <h1>Registry</h1>
         </div>
         <div className="header-right">
-          <span className="username-badge">{creds?.username}</span>
+          {creds && <span className="username-badge">{creds.username}</span>}
           <button className="btn btn-ghost" onClick={onLogout}>Sign out</button>
         </div>
       </header>

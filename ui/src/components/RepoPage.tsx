@@ -45,7 +45,6 @@ export default function RepoPage({ repo, onBack }: Props) {
   const [showDelete, setShowDelete] = useState(false)
 
   const loadTags = useCallback(async () => {
-    if (!creds) return
     setLoading(true)
     setError(null)
     setSelected(new Set())

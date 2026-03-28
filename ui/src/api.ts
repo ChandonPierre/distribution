@@ -164,7 +164,7 @@ export async function getCatalog(
   creds: Credentials | null,
   tokenCache: Map<string, string>,
 ): Promise<string[]> {
-  const res = await fetchRegistry('/v2/_catalog?n=10000', 'GET', creds, tokenCache);
+  const res = await fetchRegistry('/v2/_catalog?n=1000', 'GET', creds, tokenCache);
   if (!res.ok) throw new Error(`getCatalog failed: ${res.status}`);
   const body = await res.json() as { repositories: string[] };
   return body.repositories ?? [];
