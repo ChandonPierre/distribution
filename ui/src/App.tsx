@@ -1,5 +1,5 @@
 import { useState, useRef, useEffect } from 'react'
-import type { Credentials, Page } from './types'
+import type { Credentials, TagInfo, Page } from './types'
 import { AuthContext } from './auth'
 import { login } from './api'
 import LoginPage from './components/LoginPage'
@@ -10,6 +10,7 @@ export default function App() {
   const [creds, setCreds] = useState<Credentials | null>(null)
   const [page, setPage] = useState<Page>({ kind: 'login' })
   const tokenCache = useRef<Map<string, string>>(new Map())
+  const repoCache = useRef<Map<string, { tagNames: string[]; tagInfos: Map<string, TagInfo> }>>(new Map())
   const [catalogRepos, setCatalogRepos] = useState<string[] | null>(null)
 
   // On mount, attempt an anonymous token. If it succeeds the registry has
@@ -51,6 +52,10 @@ export default function App() {
           <RepoPage
             repo={page.repo}
             onBack={() => setPage({ kind: 'catalog' })}
+            cachedData={repoCache.current.get(page.repo)}
+            onDataLoaded={(tagNames, tagInfos) => {
+              repoCache.current.set(page.repo, { tagNames, tagInfos })
+            }}
           />
         )}
       </div>

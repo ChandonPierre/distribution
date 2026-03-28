@@ -8,6 +8,8 @@ import DeleteConfirmModal from './DeleteConfirmModal'
 interface Props {
   repo: string
   onBack: () => void
+  cachedData?: { tagNames: string[]; tagInfos: Map<string, TagInfo> }
+  onDataLoaded: (tagNames: string[], tagInfos: Map<string, TagInfo>) => void
 }
 
 function shortDigest(digest: string): string {
@@ -23,16 +25,7 @@ function formatBytes(bytes: number): string {
   return `${(bytes / Math.pow(1024, i)).toFixed(2)} ${units[i]}`
 }
 
-function formatDate(iso?: string): string {
-  if (!iso) return '—'
-  try {
-    return new Date(iso).toLocaleString()
-  } catch {
-    return iso
-  }
-}
-
-export default function RepoPage({ repo, onBack }: Props) {
+export default function RepoPage({ repo, onBack, cachedData, onDataLoaded }: Props) {
   const { creds, tokenCache } = useAuth()
 
   const [tagNames, setTagNames] = useState<string[]>([])
@@ -45,6 +38,12 @@ export default function RepoPage({ repo, onBack }: Props) {
   const [showDelete, setShowDelete] = useState(false)
 
   const loadTags = useCallback(async () => {
+    if (cachedData) {
+      setTagNames(cachedData.tagNames)
+      setTagInfos(cachedData.tagInfos)
+      setLoading(false)
+      return
+    }
     setLoading(true)
     setError(null)
     setSelected(new Set())
@@ -63,11 +62,10 @@ export default function RepoPage({ repo, onBack }: Props) {
           const tag = queue.shift()
           if (!tag) break
           try {
-            const info = await resolveTagInfo(repo, tag, creds!, tokenCache)
+            const info = await resolveTagInfo(repo, tag, creds, tokenCache)
             infos.set(tag, info)
             setTagInfos(new Map(infos))
           } catch {
-            // Leave the tag in the list without detail
             infos.set(tag, { name: tag, digest: '', size: 0 })
             setTagInfos(new Map(infos))
           }
@@ -75,11 +73,12 @@ export default function RepoPage({ repo, onBack }: Props) {
       }
 
       await Promise.all(Array.from({ length: concurrency }, worker))
+      onDataLoaded(names.sort(), infos)
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err))
       setLoading(false)
     }
-  }, [creds, tokenCache, repo])
+  }, [creds, tokenCache, repo, cachedData, onDataLoaded])
 
   useEffect(() => {
     loadTags()
@@ -182,8 +181,6 @@ export default function RepoPage({ repo, onBack }: Props) {
                   <th>Tag</th>
                   <th>Digest</th>
                   <th className="col-right">Size</th>
-                  <th>Created</th>
-                  <th>OS / Arch</th>
                 </tr>
               </thead>
               <tbody>
@@ -221,16 +218,6 @@ export default function RepoPage({ repo, onBack }: Props) {
                       </td>
                       <td className="col-right">
                         {resolving ? <span className="skeleton" style={{ width: '5ch' }} /> : formatBytes(info.size)}
-                      </td>
-                      <td>
-                        {resolving ? <span className="skeleton" style={{ width: '12ch' }} /> : formatDate(info.created)}
-                      </td>
-                      <td className="col-muted">
-                        {resolving ? (
-                          <span className="skeleton" style={{ width: '8ch' }} />
-                        ) : (
-                          [info.os, info.architecture].filter(Boolean).join(' / ') || '—'
-                        )}
                       </td>
                     </tr>
                   )

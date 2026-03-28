@@ -20,10 +20,8 @@ export default function LoginPage({ onLogin }: Props) {
     setLoading(true)
     try {
       const creds = { username: username.trim(), token: token.trim() }
-      const jwt = await login(creds)
-      // Seed the token cache with the initial (no-scope) token so the first
-      // /v2/_catalog request can skip the 401 round-trip when possible.
-      if (jwt) tokenCache.set('', jwt)
+      const jwt = await login(creds, 'registry:catalog:*')
+      if (jwt) tokenCache.set('registry:catalog:*', jwt)
       setCreds(creds)
       onLogin()
     } catch (err) {

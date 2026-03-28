@@ -91,6 +91,37 @@ export async function login(creds: Credentials | null, scope = ''): Promise<stri
 // Authenticated fetch with automatic token refresh
 // ---------------------------------------------------------------------------
 
+// In-flight token fetches keyed by scope. Concurrent 401s for the same scope
+// share one fetch instead of each firing independently (thundering herd).
+const inflightTokens = new Map<string, Promise<string>>()
+
+async function acquireToken(
+  realm: string,
+  service: string,
+  scope: string,
+  creds: Credentials | null,
+  tokenCache: Map<string, string>,
+): Promise<string> {
+  const cached = tokenCache.get(scope)
+  if (cached) return cached
+
+  const existing = inflightTokens.get(scope)
+  if (existing) return existing
+
+  const p = fetchToken(realm, service, scope, creds)
+    .then(jwt => {
+      tokenCache.set(scope, jwt)
+      inflightTokens.delete(scope)
+      return jwt
+    })
+    .catch(err => {
+      inflightTokens.delete(scope)
+      throw err
+    })
+  inflightTokens.set(scope, p)
+  return p
+}
+
 /**
  * Performs an authenticated fetch against the registry.
  * On 401 it parses the WWW-Authenticate challenge, obtains a scoped token,
@@ -126,9 +157,7 @@ export async function fetchRegistry(
     const challenge = parseBearerChallenge(wwwAuth);
     if (!challenge) throw new Error('Cannot parse WWW-Authenticate: ' + wwwAuth);
 
-    const newJwt = await fetchToken(challenge.realm, challenge.service, challenge.scope, creds);
-    tokenCache.set(challenge.scope, newJwt);
-    // Also update the scope-key cache entry so future requests skip the 401.
+    const newJwt = await acquireToken(challenge.realm, challenge.service, challenge.scope, creds, tokenCache);
     if (scopeKey !== challenge.scope) tokenCache.set(scopeKey, newJwt);
 
     res = await doFetch(newJwt);

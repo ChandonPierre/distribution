@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -72,38 +73,61 @@ func (ch *catalogHandler) GetCatalog(w http.ResponseWriter, r *http.Request) {
 	if entries == 0 {
 		moreEntries = false
 	} else if prefixes := getCatalogPrefixes(ch.Context); prefixes != nil {
-		// Prefix-filtered path: walk storage pages until we accumulate `entries`
-		// matching repos or exhaust storage. We cannot emit a Link header because
-		// the storage cursor after in-memory filtering is unreliable.
+		// Prefix-filtered path: seek the storage cursor to each prefix in sorted
+		// order so we skip irrelevant repos instead of scanning from position 0.
+		// No Link header is emitted because the raw storage cursor cannot be
+		// safely exposed after in-memory filtering.
 		moreEntries = false
-		cursor := lastEntry
+
+		sortedPrefixes := append([]string(nil), prefixes...)
+		sort.Strings(sortedPrefixes)
+
 		page := make([]string, entries)
-		for filled < entries {
-			n, err := ch.App.registry.Repositories(ch.Context, page, cursor)
-			for _, repo := range page[:n] {
-				for _, pfx := range prefixes {
+		seen := make(map[string]struct{})
+
+		for _, pfx := range sortedPrefixes {
+			if filled >= entries {
+				break
+			}
+			pfxEnd := pfx + "\xff"
+			// Setting cursor = pfx starts the scan just after the bare prefix
+			// string. Repo names always contain a path separator (e.g. "ns/img"),
+			// so they sort after "ns" and will not be skipped.
+			cursor := pfx
+			for filled < entries {
+				n, err := ch.App.registry.Repositories(ch.Context, page, cursor)
+				pastPrefix := false
+				for _, repo := range page[:n] {
 					if strings.HasPrefix(repo, pfx) {
-						repos[filled] = repo
-						filled++
+						if _, dup := seen[repo]; !dup {
+							repos[filled] = repo
+							seen[repo] = struct{}{}
+							filled++
+							if filled == entries {
+								break
+							}
+						}
+					} else if repo > pfxEnd {
+						pastPrefix = true
 						break
 					}
 				}
-				if filled == entries {
+				if pastPrefix || n == 0 {
+					break
+				}
+				if err != nil {
+					_, pathNotFound := err.(driver.PathNotFoundError)
+					if err != io.EOF && !pathNotFound {
+						ch.Errors = append(ch.Errors, errcode.ErrorCodeUnknown.WithDetail(err))
+						return
+					}
+					break
+				}
+				cursor = page[n-1]
+				if cursor >= pfxEnd {
 					break
 				}
 			}
-			if err != nil {
-				_, pathNotFound := err.(driver.PathNotFoundError)
-				if err != io.EOF && !pathNotFound {
-					ch.Errors = append(ch.Errors, errcode.ErrorCodeUnknown.WithDetail(err))
-					return
-				}
-				break
-			}
-			if n == 0 {
-				break
-			}
-			cursor = page[n-1]
 		}
 	} else {
 		returnedRepositories, err := ch.App.registry.Repositories(ch.Context, repos, lastEntry)
