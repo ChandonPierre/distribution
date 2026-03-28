@@ -927,6 +927,9 @@ func (app *App) authorized(w http.ResponseWriter, r *http.Request, context *Cont
 
 	ctx := withUser(context.Context, grant.User)
 	ctx = withResources(ctx, grant.Resources)
+	if grant.CatalogPrefixes != nil {
+		ctx = withCatalogPrefixes(ctx, grant.CatalogPrefixes)
+	}
 
 	dcontext.GetLogger(ctx, userNameKey).Info("authorized request")
 	// TODO(stevvooe): This pattern needs to be cleaned up a bit. One context

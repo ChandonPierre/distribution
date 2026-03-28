@@ -32,7 +32,10 @@ type tokenResponse struct {
 // registryClaims is the JWT payload for registry-issued tokens.
 type registryClaims struct {
 	josejwt.Claims
-	Access []resourceActions `json:"access"`
+	Access          []resourceActions `json:"access"`
+	// CatalogPrefixes, when present, restricts /v2/_catalog responses to
+	// repositories whose names start with one of the listed prefixes.
+	CatalogPrefixes []string          `json:"catalog_prefixes,omitempty"`
 }
 
 // resourceActions mirrors the Docker token spec access claim element.
@@ -251,7 +254,8 @@ func (h *tokenEndpointHandler) ServeHTTP(w http.ResponseWriter, r *http.Request)
 			Expiry:    josejwt.NewNumericDate(now.Add(h.tokenExpiry)),
 			NotBefore: josejwt.NewNumericDate(now.Add(-60 * time.Second)),
 		},
-		Access: grantedAccess,
+		Access:          grantedAccess,
+		CatalogPrefixes: catalogPrefixesForToken(ps, tokenMap),
 	}
 
 	ks := h.signingKey.Load()

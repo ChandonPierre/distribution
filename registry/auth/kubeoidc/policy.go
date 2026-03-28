@@ -16,6 +16,15 @@ import (
 type compiledPolicy struct {
 	name    string
 	program cel.Program
+
+	// catalogPrefix is a static prefix. catalogPrefixesForToken probes the
+	// main program with this prefix to decide whether to include it.
+	catalogPrefix string
+
+	// catalogPrefixProgram is compiled from catalog_prefix_expression. When
+	// non-nil it is evaluated against the token map and its string result is
+	// used directly as the catalog prefix, without probing the main program.
+	catalogPrefixProgram cel.Program
 }
 
 // policySet is an atomically replaceable set of compiled CEL policies.
@@ -48,7 +57,22 @@ func compilePolicies(cfgs []policyConfig, env *cel.Env) ([]*compiledPolicy, erro
 		if err != nil {
 			return nil, fmt.Errorf("policy %q program error: %w", cfg.Name, err)
 		}
-		compiled = append(compiled, &compiledPolicy{name: cfg.Name, program: prg})
+		cp := &compiledPolicy{
+			name:          cfg.Name,
+			program:       prg,
+			catalogPrefix: cfg.CatalogPrefix,
+		}
+		if cfg.CatalogPrefixExpression != "" {
+			pAst, pIss := env.Compile(cfg.CatalogPrefixExpression)
+			if pIss != nil && pIss.Err() != nil {
+				return nil, fmt.Errorf("policy %q catalog_prefix_expression compile error: %w", cfg.Name, pIss.Err())
+			}
+			cp.catalogPrefixProgram, err = env.Program(pAst)
+			if err != nil {
+				return nil, fmt.Errorf("policy %q catalog_prefix_expression program error: %w", cfg.Name, err)
+			}
+		}
+		compiled = append(compiled, cp)
 	}
 	return compiled, nil
 }

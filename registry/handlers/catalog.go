@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/url"
 	"strconv"
+	"strings"
 
 	"github.com/distribution/distribution/v3/registry/api/errcode"
 	"github.com/distribution/distribution/v3/registry/storage/driver"
@@ -82,6 +83,27 @@ func (ch *catalogHandler) GetCatalog(w http.ResponseWriter, r *http.Request) {
 			moreEntries = false
 		}
 		filled = returnedRepositories
+	}
+
+	// Apply catalog prefix filter when present.
+	// Post-fetch filtering means a page may
+	// contain fewer than n entries; this is an accepted v1 limitation.
+	if prefixes := getCatalogPrefixes(ch.Context); prefixes != nil {
+		n := 0
+		for _, repo := range repos[:filled] {
+			for _, pfx := range prefixes {
+				if strings.HasPrefix(repo, pfx) {
+					repos[n] = repo
+					n++
+					break
+				}
+			}
+		}
+		filled = n
+		// Do not advertise a next-page link when we have filtered results,
+		// since the cursor position in the backing store is unreliable after
+		// in-memory filtering.
+		moreEntries = false
 	}
 
 	w.Header().Set("Content-Type", "application/json")

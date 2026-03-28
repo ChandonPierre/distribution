@@ -49,6 +49,23 @@ type config struct {
 type policyConfig struct {
 	Name       string `mapstructure:"name" yaml:"name"`
 	Expression string `mapstructure:"expression" yaml:"expression"`
+
+	// CatalogPrefix is a static repository name prefix. When set, the policy
+	// engine probes the main expression with request["repository"]=CatalogPrefix
+	// at token issuance; if the expression grants access, CatalogPrefix is
+	// embedded in the catalog_prefixes JWT claim.
+	//
+	// Use CatalogPrefixExpression instead when the prefix must be derived from
+	// the token itself (e.g. the tenant namespace stored in a JWT claim).
+	CatalogPrefix string `mapstructure:"catalog_prefix" yaml:"catalog_prefix"`
+
+	// CatalogPrefixExpression is a CEL expression that is evaluated against
+	// the token map and must return a non-empty string. That string is used as
+	// the catalog prefix for this caller. Useful when the tenant identifier
+	// comes from a JWT claim rather than being known statically.
+	//
+	// Example: token["kubernetes.io/serviceaccount/namespace"]
+	CatalogPrefixExpression string `mapstructure:"catalog_prefix_expression" yaml:"catalog_prefix_expression"`
 }
 
 // accessController implements auth.AccessController for Kubernetes OIDC service account tokens.
@@ -399,6 +416,75 @@ func (ac *accessController) Authorized(req *http.Request, accessItems ...auth.Ac
 	}, nil
 }
 
+// catalogPrefixesForToken returns the set of catalog repository prefixes that
+// the given token map is permitted to see, based on policies that opt in via
+// catalog_prefix or catalog_prefix_expression.
+//
+// Two evaluation strategies are supported per policy:
+//
+//   - catalog_prefix_expression (preferred): the CEL expression is evaluated
+//     against the token and must return a non-empty string. That string becomes
+//     the prefix. This supports tenant namespaces stored in JWT claims.
+//
+//   - catalog_prefix (static fallback): the main policy expression is probed
+//     with request["repository"]=<prefix>. If access is granted, the static
+//     prefix is included.
+//
+// Returns a non-nil slice so callers can distinguish "nothing granted" from
+// "no filtering in effect" (nil).
+func catalogPrefixesForToken(ps *policySet, tokenMap map[string]any) []string {
+	seen := make(map[string]struct{})
+	var prefixes []string
+
+	for _, p := range ps.policies {
+		var prefix string
+
+		switch {
+		case p.catalogPrefixProgram != nil:
+			// Dynamic path: evaluate the prefix expression against the token.
+			out, _, err := p.catalogPrefixProgram.Eval(map[string]any{
+				"token":   tokenMap,
+				"request": map[string]any{},
+			})
+			if err != nil {
+				logrus.Warnf("kubeoidc: policy %q catalog_prefix_expression eval error: %v", p.name, err)
+				continue
+			}
+			s, ok := out.Value().(string)
+			if !ok || s == "" {
+				continue
+			}
+			prefix = s
+
+		case p.catalogPrefix != "":
+			// Static path: probe the main expression with the fixed prefix.
+			requestMap := map[string]any{
+				"type":       "repository",
+				"repository": p.catalogPrefix,
+				"actions":    []string{"pull"},
+			}
+			granted, err := evaluatePolicies([]*compiledPolicy{p}, tokenMap, requestMap)
+			if err != nil || !granted {
+				continue
+			}
+			prefix = p.catalogPrefix
+
+		default:
+			continue
+		}
+
+		if _, dup := seen[prefix]; !dup {
+			seen[prefix] = struct{}{}
+			prefixes = append(prefixes, prefix)
+		}
+	}
+
+	if prefixes == nil {
+		return []string{}
+	}
+	return prefixes
+}
+
 // authorizeRegistryToken validates a registry-issued JWT (from the built-in token endpoint)
 // and checks that its embedded access claims cover the requested accessItems.
 func (ac *accessController) authorizeRegistryToken(
@@ -442,7 +528,8 @@ func (ac *accessController) authorizeRegistryToken(
 	}
 
 	return &auth.Grant{
-		User:      auth.UserInfo{Name: claims.Subject},
-		Resources: grantedResources,
+		User:            auth.UserInfo{Name: claims.Subject},
+		Resources:       grantedResources,
+		CatalogPrefixes: claims.CatalogPrefixes,
 	}, nil
 }

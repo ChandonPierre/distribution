@@ -160,3 +160,30 @@ func authorizedResources(ctx context.Context) []auth.Resource {
 
 	return nil
 }
+
+type catalogPrefixesKey struct{}
+
+// withCatalogPrefixes returns a context that carries the allowed catalog
+// repository prefixes for this request. A nil slice means no filtering.
+func withCatalogPrefixes(ctx context.Context, prefixes []string) context.Context {
+	return catalogPrefixesContext{Context: ctx, prefixes: prefixes}
+}
+
+type catalogPrefixesContext struct {
+	context.Context
+	prefixes []string
+}
+
+func (c catalogPrefixesContext) Value(key any) any {
+	if key == (catalogPrefixesKey{}) {
+		return c.prefixes
+	}
+	return c.Context.Value(key)
+}
+
+// getCatalogPrefixes returns the catalog prefix filter for this request.
+// Returns nil if no filtering is in effect (all repositories visible).
+func getCatalogPrefixes(ctx context.Context) []string {
+	prefixes, _ := ctx.Value(catalogPrefixesKey{}).([]string)
+	return prefixes
+}

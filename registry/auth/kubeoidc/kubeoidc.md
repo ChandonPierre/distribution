@@ -8,16 +8,18 @@ The feature consists of five components:
 
 | File | Responsibility |
 |---|---|
-| `accesscontroller.go` | Provider registration, config, `Authorized()`, registry-issued JWT validation |
+| `accesscontroller.go` | Provider registration, config, `Authorized()`, registry-issued JWT validation, catalog prefix probe |
 | `oidc.go` | OIDC discovery, per-issuer JWKS cache, HTTP client |
 | `policy.go` | CEL policy compilation, evaluation, live file reload |
 | `tokenendpoint.go` | Built-in `/auth/token` HTTP handler, registry JWT issuance |
 | `*_test.go` | 30+ unit and integration tests |
 
-Two additional changes outside this package:
+Additional changes outside this package:
 
-- `registry/auth/auth.go` — new `TokenEndpointer` optional interface
-- `registry/handlers/app.go` — auto-registers the token endpoint if the access controller implements `TokenEndpointer`
+- `registry/auth/auth.go` — new `TokenEndpointer` optional interface; `CatalogPrefixes` field on `Grant`
+- `registry/handlers/app.go` — auto-registers the token endpoint; threads `CatalogPrefixes` into request context
+- `registry/handlers/context.go` — `withCatalogPrefixes` / `getCatalogPrefixes` context helpers
+- `registry/handlers/catalog.go` — post-fetch prefix filter on `/v2/_catalog` responses
 
 ---
 
@@ -144,6 +146,37 @@ Policies are evaluated in declaration order. The first policy that evaluates to 
 
 For multi-access requests (e.g., a push that requires both `pull` and `push`), each access item is evaluated independently. All items must be granted; if any is denied, `ErrInsufficientScope` is returned.
 
+#### Catalog prefix filtering
+
+Each policy may optionally carry a `catalog_prefix` or `catalog_prefix_expression` field. When present, the policy participates in `/v2/_catalog` multi-tenancy filtering:
+
+1. At token issuance, `catalogPrefixesForToken` iterates over policies that declare either field and resolves a prefix string for this specific token (see below).
+2. The union of resolved prefixes is embedded in the registry JWT as the `catalog_prefixes` claim (omitted when empty, to keep tokens compact).
+3. When `Authorized()` validates a registry-issued token for a catalog request, it propagates `catalog_prefixes` from the JWT into `auth.Grant.CatalogPrefixes`.
+4. `GetCatalog` filters the repository list in memory, keeping only names that start with at least one of the granted prefixes.
+
+**Two resolution strategies:**
+
+`catalog_prefix_expression` (preferred for multi-tenant deployments) — a CEL expression evaluated against the token map that must return a non-empty string. The result is used directly as the prefix. This is the right choice when the tenant identifier lives in a JWT claim:
+
+```yaml
+# request["repository"].startsWith(token["kubernetes.io/namespace"]) in the
+# main expression; derive the same prefix from the token for catalog filtering.
+catalog_prefix_expression: 'token["kubernetes.io/serviceaccount/namespace"]'
+```
+
+`catalog_prefix` (static) — a fixed string. The main policy expression is probed with `request["repository"] = <prefix>` at token issuance; if the expression grants pull access, the prefix is included. Suitable when the prefix is known ahead of time and baked into the expression:
+
+```yaml
+catalog_prefix: cw4637/
+```
+
+A `nil` `CatalogPrefixes` value means no filtering (all repositories visible). This applies to:
+- Direct SA token requests (the `Authorized()` OIDC path — a v1 limitation; these callers do not go through the token endpoint where prefix resolution occurs).
+- Non-kubeoidc deployments (`token`, `htpasswd`, etc.).
+
+A non-nil empty slice means the caller was issued a catalog-scoped token but no prefixes resolved, so the catalog response is empty.
+
 #### Live policy reload
 
 When `policy_file` is configured, a background goroutine polls the file every `policy_reload_interval` (default 30s). It computes a SHA-256 hash of the file contents to avoid unnecessary recompilation. On a detected change:
@@ -254,8 +287,25 @@ auth:
           token["sub"].startsWith("system:serviceaccount:ci:") &&
           request["type"] == "repository" &&
           "push" in request["actions"]
-      - name: all-pull
-        expression: '"pull" in request["actions"]'
+
+      # Dynamic catalog prefix: tenant namespace comes from the SA token itself.
+      # A single policy covers all tenants; the catalog is scoped per-caller.
+      - name: tenant-pull
+        expression: |
+          token["iss"].startsWith("https://oidc.example.com/id/") &&
+          request["type"] == "repository" &&
+          request["repository"].startsWith(token["kubernetes.io/serviceaccount/namespace"] + "/") &&
+          "pull" in request["actions"]
+        catalog_prefix_expression: 'token["kubernetes.io/serviceaccount/namespace"] + "/"'
+
+      # Static catalog prefix: prefix is fixed and known at policy-write time.
+      - name: tenant-a-pull
+        expression: |
+          token["iss"].startsWith("https://oidc.example.com/id/tenant-a") &&
+          request["type"] == "repository" &&
+          request["repository"].startsWith("tenant-a/") &&
+          "pull" in request["actions"]
+        catalog_prefix: tenant-a/
 
     # OR: external policy file with live reload
     policy_file: /etc/registry/policies.yaml
@@ -270,6 +320,15 @@ auth:
 | `request` | `map(string, dyn)` | Access request. Keys: `type` (string), `repository` (string), `actions` (list of strings) |
 
 `service` is optional. When omitted, the JWT audience check is skipped entirely and CEL policies are solely responsible for determining access. This is useful when tokens from multiple issuers use different `aud` values (e.g., EKS tokens use `sts.amazonaws.com`).
+
+### Policy Fields
+
+| Field | Required | Description |
+|---|---|---|
+| `name` | yes | Human-readable identifier (appears in log warnings on eval errors) |
+| `expression` | yes | CEL boolean expression; `true` = access granted |
+| `catalog_prefix` | no | Static repository name prefix for `/v2/_catalog` filtering. The main expression is probed with `request["repository"] = <prefix>` at token issuance; if granted, the prefix is embedded in `catalog_prefixes`. |
+| `catalog_prefix_expression` | no | CEL expression evaluated against the token map; must return a non-empty string used as the catalog prefix. Takes precedence over `catalog_prefix` when both are set. Use this when the tenant/org identifier is a JWT claim. |
 
 ---
 
@@ -296,6 +355,16 @@ Registry-issued tokens embed an explicit `access` claim listing exactly which re
 ### Ephemeral key warning
 
 When no `signing_key` is configured, the ephemeral key is logged as a warning at startup. Production deployments should always configure a persistent signing key.
+
+### Catalog multi-tenancy
+
+Without `catalog_prefix` policies, `/v2/_catalog` returns all repository names in the registry. In a multi-tenant deployment this leaks the existence of other tenants' repositories. Add a `catalog_prefix` to every tenant policy to restrict catalog responses to that tenant's namespace.
+
+The filter is applied **after** storage retrieval, so it does not prevent the storage layer from reading all repository names internally. The goal is confidentiality of the response, not a storage-layer access control boundary.
+
+**v1 limitation**: When a client holds a registry-issued token with `catalog_prefixes`, paginated catalog responses may return fewer than `n` entries per page (because filtering happens post-fetch). Next-page links are suppressed when filtering is active to avoid cursor drift. Clients should treat an absent `Link` header as end-of-list.
+
+Direct SA-token requests (clients that present an SA token as the Bearer on `/v2/_catalog` instead of first exchanging it at the token endpoint) do not benefit from catalog filtering in v1. The `CatalogPrefixes` field is nil on the `Authorized()` OIDC path. Enforce catalog access via CEL policies that gate on `request["type"] == "registry"` if needed.
 
 ### Clock skew
 

@@ -79,6 +79,11 @@ type Access struct {
 type Grant struct {
 	User      UserInfo   // The authenticated user for the request.
 	Resources []Resource // The list of resources which have been authorized for the request.
+	// CatalogPrefixes restricts /v2/_catalog responses to repositories that
+	// start with one of these prefixes. A nil slice means no filtering (all
+	// repositories are visible). A non-nil empty slice means catalog access is
+	// granted but no repositories match (e.g. empty-prefix policy).
+	CatalogPrefixes []string
 }
 
 // Challenge is a special error type which is used for HTTP 401 Unauthorized
