@@ -137,6 +137,7 @@ export default function RepoPage({ repo, onBack }: Props) {
           </div>
         </div>
         <div className="header-right">
+          {creds && (
           <button
             className="btn btn-danger"
             disabled={!someChecked}
@@ -150,6 +151,7 @@ export default function RepoPage({ repo, onBack }: Props) {
             </svg>
             Delete ({selected.size})
           </button>
+          )}
         </div>
       </header>
 

@@ -5,9 +5,11 @@ import { getCatalog } from '../api'
 interface Props {
   onSelectRepo: (repo: string) => void
   onLogout: () => void
+  cachedRepos: string[] | null
+  onReposLoaded: (repos: string[]) => void
 }
 
-export default function CatalogPage({ onSelectRepo, onLogout }: Props) {
+export default function CatalogPage({ onSelectRepo, onLogout, cachedRepos, onReposLoaded }: Props) {
   const { creds, tokenCache } = useAuth()
   const [repos, setRepos] = useState<string[]>([])
   const [filter, setFilter] = useState('')
@@ -15,18 +17,25 @@ export default function CatalogPage({ onSelectRepo, onLogout }: Props) {
   const [error, setError] = useState<string | null>(null)
 
   useEffect(() => {
+    if (cachedRepos !== null) {
+      setRepos(cachedRepos)
+      setLoading(false)
+      return
+    }
     setLoading(true)
     setError(null)
     getCatalog(creds, tokenCache)
       .then(r => {
-        setRepos(r.sort())
+        const sorted = r.sort()
+        setRepos(sorted)
+        onReposLoaded(sorted)
         setLoading(false)
       })
       .catch(err => {
         setError(err instanceof Error ? err.message : String(err))
         setLoading(false)
       })
-  }, [creds, tokenCache])
+  }, [])
 
   const filtered = useMemo(() => {
     const q = filter.toLowerCase()

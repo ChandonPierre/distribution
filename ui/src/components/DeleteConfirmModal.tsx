@@ -20,7 +20,6 @@ export default function DeleteConfirmModal({ repo, selected, onDone, onCancel }:
   const [errors, setErrors] = useState<string[]>([])
 
   async function handleConfirm() {
-    if (!creds) return
     setStatus('running')
     const deleted: string[] = []
     const errs: string[] = []

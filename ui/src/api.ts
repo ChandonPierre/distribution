@@ -63,7 +63,7 @@ async function fetchToken(
  * Pass null to attempt an anonymous token (for public access paths).
  * Returns the JWT string, or '' if the registry requires no auth.
  */
-export async function login(creds: Credentials | null): Promise<string> {
+export async function login(creds: Credentials | null, scope = ''): Promise<string> {
   const headers: Record<string, string> = {};
   if (creds) headers['Authorization'] = basicAuth(creds);
   // First hit /v2/ to get the WWW-Authenticate header pointing at the realm.
@@ -75,7 +75,7 @@ export async function login(creds: Credentials | null): Promise<string> {
     if (!challenge) {
       throw new Error('Unrecognised WWW-Authenticate header: ' + wwwAuth);
     }
-    return fetchToken(challenge.realm, challenge.service, '', creds);
+    return fetchToken(challenge.realm, challenge.service, scope, creds);
   }
 
   if (res.ok) {
@@ -286,22 +286,5 @@ export async function resolveTagInfo(
   const totalSize = m.layers.reduce((s, l) => s + l.size, 0);
   const layers = m.layers.map(l => ({ digest: l.digest, size: l.size }));
 
-  let created: string | undefined;
-  let architecture: string | undefined;
-  let os: string | undefined;
-  let configDigest: string | undefined;
-
-  if (m.config?.digest) {
-    configDigest = m.config.digest;
-    try {
-      const cfg = await getImageConfig(repo, m.config.digest, creds, tokenCache);
-      created = cfg.created;
-      architecture = cfg.architecture;
-      os = cfg.os;
-    } catch {
-      // non-fatal — just leave those fields undefined
-    }
-  }
-
-  return { name: tag, digest, size: totalSize, created, architecture, os, layers, configDigest };
+  return { name: tag, digest, size: totalSize, layers, configDigest: m.config?.digest };
 }

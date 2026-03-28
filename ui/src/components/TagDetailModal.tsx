@@ -1,6 +1,8 @@
-import { useState } from 'react'
+import { useState, useEffect } from 'react'
 import type { MouseEvent } from 'react'
 import type { TagInfo } from '../types'
+import { useAuth } from '../auth'
+import { getImageConfig } from '../api'
 
 interface Props {
   repo: string
@@ -31,9 +33,28 @@ function formatDate(iso?: string): string {
 }
 
 export default function TagDetailModal({ repo, tagInfo, onClose }: Props) {
+  const { creds, tokenCache } = useAuth()
   const host = window.location.host
   const pullCmd = `docker pull ${host}/${repo}:${tagInfo.name}`
   const [copied, setCopied] = useState(false)
+  const [created, setCreated] = useState(tagInfo.created)
+  const [architecture, setArchitecture] = useState(tagInfo.architecture)
+  const [os, setOs] = useState(tagInfo.os)
+  const [loadingConfig, setLoadingConfig] = useState(
+    !!tagInfo.configDigest && !tagInfo.created && !tagInfo.architecture && !tagInfo.os
+  )
+
+  useEffect(() => {
+    if (!tagInfo.configDigest || tagInfo.created || tagInfo.architecture || tagInfo.os) return
+    getImageConfig(repo, tagInfo.configDigest, creds, tokenCache)
+      .then(cfg => {
+        setCreated(cfg.created)
+        setArchitecture(cfg.architecture)
+        setOs(cfg.os)
+      })
+      .catch(() => {})
+      .finally(() => setLoadingConfig(false))
+  }, [repo, tagInfo.configDigest])
 
   function handleCopy() {
     navigator.clipboard.writeText(pullCmd).then(() => {
@@ -72,10 +93,10 @@ export default function TagDetailModal({ repo, tagInfo, onClose }: Props) {
               <dd>{formatBytes(tagInfo.size)}</dd>
 
               <dt>Created</dt>
-              <dd>{formatDate(tagInfo.created)}</dd>
+              <dd>{loadingConfig ? <span className="skeleton" style={{ width: '14ch' }} /> : formatDate(created)}</dd>
 
               <dt>OS / Arch</dt>
-              <dd>{[tagInfo.os, tagInfo.architecture].filter(Boolean).join(' / ') || '—'}</dd>
+              <dd>{loadingConfig ? <span className="skeleton" style={{ width: '8ch' }} /> : ([os, architecture].filter(Boolean).join(' / ') || '—')}</dd>
             </dl>
           </section>
 

@@ -10,13 +10,14 @@ export default function App() {
   const [creds, setCreds] = useState<Credentials | null>(null)
   const [page, setPage] = useState<Page>({ kind: 'login' })
   const tokenCache = useRef<Map<string, string>>(new Map())
+  const [catalogRepos, setCatalogRepos] = useState<string[] | null>(null)
 
   // On mount, attempt an anonymous token. If it succeeds the registry has
   // public repos — go straight to the catalog without requiring login.
   useEffect(() => {
-    login(null)
+    login(null, 'registry:catalog:*')
       .then(jwt => {
-        tokenCache.current.set('', jwt)
+        tokenCache.current.set('registry:catalog:*', jwt)
         setPage({ kind: 'catalog' })
       })
       .catch(() => {
@@ -40,6 +41,8 @@ export default function App() {
         )}
         {page.kind === 'catalog' && (
           <CatalogPage
+            cachedRepos={catalogRepos}
+            onReposLoaded={setCatalogRepos}
             onSelectRepo={(repo) => setPage({ kind: 'repo', repo })}
             onLogout={() => { handleSetCreds(null) }}
           />
