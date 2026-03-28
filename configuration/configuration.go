@@ -69,6 +69,8 @@ type Configuration struct {
 	// Tags provides configuration for the tags list (/v2/<name>/tags/list) endpoint.
 	// It allows specifying the maximum number of tags returned by the endpoint.
 	Tags Tags `yaml:"tags,omitempty"`
+	// UI configures the built-in web UI served at /ui/.
+	UI UI `yaml:"ui,omitempty"`
 
 	// Proxy defines the configuration options for using the registry as a pull-through cache.
 	Proxy Proxy `yaml:"proxy,omitempty"`
@@ -93,6 +95,14 @@ type Repository struct {
 	// If this field is non-empty, the registry enforces that all uploaded
 	// content belongs to one of the specified classes.
 	Classes []string `yaml:"classes"`
+}
+
+// UI provides configuration options for the built-in web UI.
+type UI struct {
+	// Enabled, when true, registers the /ui/ route and serves the embedded
+	// React application. Defaults to false. Must be explicitly set to enable
+	// the UI; omitting this section leaves the UI inactive.
+	Enabled bool `yaml:"enabled,omitempty"`
 }
 
 // Catalog provides configuration options for the /v2/_catalog endpoint.

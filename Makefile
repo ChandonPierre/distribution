@@ -45,7 +45,7 @@ BINARIES=$(addprefix bin/,$(COMMANDS))
 TESTFLAGS ?= -v $(TESTFLAGS_RACE)
 TESTFLAGS_PARALLEL ?= 8
 
-.PHONY: all build binaries clean test test-race test-full integration test-coverage validate lint validate-git validate-vendor vendor mod-outdated image validate-authors authors
+.PHONY: all build binaries ui clean test test-race test-full integration test-coverage validate lint validate-git validate-vendor vendor mod-outdated image validate-authors authors
 .DEFAULT: all
 
 .PHONY: FORCE
@@ -64,6 +64,10 @@ bin/%: cmd/% FORCE ## build individual binary
 
 binaries: $(BINARIES) ## build binaries
 	@echo "$(WHALE) $@"
+
+ui: ## build the React UI (outputs to registry/handlers/ui/dist, embedded into the Go binary)
+	@echo "$(WHALE) $@"
+	@cd ui && npm ci && npm run build
 
 build: ## build go packages
 	@echo "$(WHALE) $@"

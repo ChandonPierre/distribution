@@ -43,3 +43,8 @@ tests/miniodata
 **/.hugo_build.lock
 docs/resources
 docs/public
+
+# UI
+ui/node_modules/
+# ui/dist is intentionally NOT ignored — the compiled assets are checked in
+# so `go build` works without running npm first. Use `make ui` to rebuild.

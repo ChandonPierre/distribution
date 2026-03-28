@@ -369,6 +369,11 @@ func NewApp(ctx context.Context, config *configuration.Configuration) *App {
 		dcontext.GetLogger(app).Warnf("Registry does not implement RepositoryRemover. Will not be able to delete repos and tags")
 	}
 
+	// Serve the compiled React UI under /ui/ only when explicitly enabled.
+	if config.UI.Enabled {
+		app.router.PathPrefix("/ui/").Handler(uiHandler())
+	}
+
 	return app
 }
 
