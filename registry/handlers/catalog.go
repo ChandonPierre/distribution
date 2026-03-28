@@ -71,6 +71,40 @@ func (ch *catalogHandler) GetCatalog(w http.ResponseWriter, r *http.Request) {
 	// entries is guaranteed to be >= 0 and < maximumConfiguredEntries
 	if entries == 0 {
 		moreEntries = false
+	} else if prefixes := getCatalogPrefixes(ch.Context); prefixes != nil {
+		// Prefix-filtered path: walk storage pages until we accumulate `entries`
+		// matching repos or exhaust storage. We cannot emit a Link header because
+		// the storage cursor after in-memory filtering is unreliable.
+		moreEntries = false
+		cursor := lastEntry
+		page := make([]string, entries)
+		for filled < entries {
+			n, err := ch.App.registry.Repositories(ch.Context, page, cursor)
+			for _, repo := range page[:n] {
+				for _, pfx := range prefixes {
+					if strings.HasPrefix(repo, pfx) {
+						repos[filled] = repo
+						filled++
+						break
+					}
+				}
+				if filled == entries {
+					break
+				}
+			}
+			if err != nil {
+				_, pathNotFound := err.(driver.PathNotFoundError)
+				if err != io.EOF && !pathNotFound {
+					ch.Errors = append(ch.Errors, errcode.ErrorCodeUnknown.WithDetail(err))
+					return
+				}
+				break
+			}
+			if n == 0 {
+				break
+			}
+			cursor = page[n-1]
+		}
 	} else {
 		returnedRepositories, err := ch.App.registry.Repositories(ch.Context, repos, lastEntry)
 		if err != nil {
@@ -83,27 +117,6 @@ func (ch *catalogHandler) GetCatalog(w http.ResponseWriter, r *http.Request) {
 			moreEntries = false
 		}
 		filled = returnedRepositories
-	}
-
-	// Apply catalog prefix filter when present.
-	// Post-fetch filtering means a page may
-	// contain fewer than n entries; this is an accepted v1 limitation.
-	if prefixes := getCatalogPrefixes(ch.Context); prefixes != nil {
-		n := 0
-		for _, repo := range repos[:filled] {
-			for _, pfx := range prefixes {
-				if strings.HasPrefix(repo, pfx) {
-					repos[n] = repo
-					n++
-					break
-				}
-			}
-		}
-		filled = n
-		// Do not advertise a next-page link when we have filtered results,
-		// since the cursor position in the backing store is unreliable after
-		// in-memory filtering.
-		moreEntries = false
 	}
 
 	w.Header().Set("Content-Type", "application/json")
