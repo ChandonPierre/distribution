@@ -454,6 +454,18 @@ func catalogPrefixesForToken(ps *policySet, tokenMap map[string]any) []string {
 			if !ok || s == "" {
 				continue
 			}
+			// Confirm the token actually grants access under this policy by
+			// probing the main expression with repository=<prefix>/. Without
+			// this check a token from a different issuer could still produce
+			// a non-empty prefix string and leak catalog entries.
+			probeMap := map[string]any{
+				"type":       "repository",
+				"repository": s + "/",
+				"actions":    []string{"pull"},
+			}
+			if granted, err := evaluatePolicies([]*compiledPolicy{p}, tokenMap, probeMap); err != nil || !granted {
+				continue
+			}
 			prefix = s
 
 		case p.catalogPrefix != "":
