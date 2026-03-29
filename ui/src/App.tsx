@@ -28,8 +28,11 @@ export default function App() {
 
   function handleSetCreds(c: Credentials | null) {
     setCreds(c)
-    tokenCache.current.clear()
-    if (c === null) setPage({ kind: 'login' })
+    if (c === null) {
+      tokenCache.current.clear()
+      setCatalogRepos(null)
+      setPage({ kind: 'login' })
+    }
   }
 
   return (
