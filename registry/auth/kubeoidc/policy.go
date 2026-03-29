@@ -26,6 +26,10 @@ type compiledPolicy struct {
 	// non-nil it is evaluated against the token map and its string result is
 	// used directly as the catalog prefix, without probing the main program.
 	catalogPrefixProgram cel.Program
+
+	// catalogFullAccess, when true, grants unrestricted catalog access to any
+	// token matching the main expression (no prefix filtering).
+	catalogFullAccess bool
 }
 
 // policySet is an atomically replaceable set of compiled CEL policies.
@@ -62,9 +66,10 @@ func compilePolicies(cfgs []policyConfig, env *cel.Env) ([]*compiledPolicy, erro
 			return nil, fmt.Errorf("policy %q program error: %w", cfg.Name, err)
 		}
 		cp := &compiledPolicy{
-			name:          cfg.Name,
-			program:       prg,
-			catalogPrefix: cfg.CatalogPrefix,
+			name:              cfg.Name,
+			program:           prg,
+			catalogPrefix:     cfg.CatalogPrefix,
+			catalogFullAccess: cfg.CatalogFullAccess,
 		}
 		if cfg.CatalogPrefixExpression != "" {
 			pAst, pIss := env.Compile(cfg.CatalogPrefixExpression)

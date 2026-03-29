@@ -66,6 +66,12 @@ type policyConfig struct {
 	//
 	// Example: token["kubernetes.io/serviceaccount/namespace"]
 	CatalogPrefixExpression string `mapstructure:"catalog_prefix_expression" yaml:"catalog_prefix_expression"`
+
+	// CatalogFullAccess, when true, grants unrestricted /v2/_catalog access
+	// to any token that satisfies the main policy expression. No prefix
+	// filtering is applied; the caller sees every repository in the registry.
+	// Takes precedence over catalog_prefix and catalog_prefix_expression.
+	CatalogFullAccess bool `mapstructure:"catalog_full_access" yaml:"catalog_full_access"`
 }
 
 // accessController implements auth.AccessController for Kubernetes OIDC service account tokens.
@@ -437,6 +443,20 @@ func catalogPrefixesForToken(ps *policySet, tokenMap map[string]any) []string {
 	var prefixes []string
 
 	for _, p := range ps.policies {
+		// Full-access path: if the policy expression matches, skip all prefix
+		// filtering and return nil so the caller sees the entire catalog.
+		if p.catalogFullAccess {
+			requestMap := map[string]any{
+				"type":       "registry",
+				"repository": "",
+				"actions":    []string{"*"},
+			}
+			if granted, err := evaluatePolicies([]*compiledPolicy{p}, tokenMap, requestMap); err == nil && granted {
+				return nil
+			}
+			continue
+		}
+
 		var prefix string
 
 		switch {
