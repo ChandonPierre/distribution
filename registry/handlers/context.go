@@ -50,6 +50,12 @@ func getName(ctx context.Context) (name string) {
 	return dcontext.GetStringValue(ctx, "vars.name")
 }
 
+// getSubdomainNamespace returns the namespace extracted from the request
+// subdomain when subdomain namespacing is active, or the empty string otherwise.
+func getSubdomainNamespace(ctx context.Context) string {
+	return dcontext.GetStringValue(ctx, "subdomain.namespace")
+}
+
 func getReference(ctx context.Context) (reference string) {
 	return dcontext.GetStringValue(ctx, "vars.reference")
 }

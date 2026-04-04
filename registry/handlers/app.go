@@ -176,6 +176,10 @@ func NewApp(ctx context.Context, config *configuration.Configuration) *App {
 		app.httpHost = *u
 	}
 
+	if config.HTTP.SubdomainNamespacing && app.httpHost.Host == "" {
+		panic(`subdomain namespacing requires http.host to be configured`)
+	}
+
 	if app.isCache {
 		options = append(options, storage.DisableDigestResumption)
 	}
@@ -847,6 +851,22 @@ func (app *App) logError(ctx context.Context, errors errcode.Errors) {
 func (app *App) context(w http.ResponseWriter, r *http.Request) *Context {
 	ctx := r.Context()
 	ctx = dcontext.WithVars(ctx, r)
+
+	// In subdomain-namespacing mode, extract the namespace from the Host
+	// subdomain and inject it into vars.name so all downstream code
+	// (storage, auth, catalog) sees "namespace/repo" without any changes.
+	if ns := app.extractSubdomainNamespace(r); ns != "" {
+		pathName := dcontext.GetStringValue(ctx, "vars.name")
+		if pathName != "" {
+			ctx = dcontext.WithValues(ctx, map[string]any{
+				"vars.name": ns + "/" + pathName,
+			})
+		}
+		ctx = dcontext.WithValues(ctx, map[string]any{
+			"subdomain.namespace": ns,
+		})
+	}
+
 	ctx = dcontext.WithLogger(ctx, dcontext.GetLogger(ctx,
 		"vars.name",
 		"vars.reference",
@@ -862,12 +882,57 @@ func (app *App) context(w http.ResponseWriter, r *http.Request) *Context {
 		// A "host" item in the configuration takes precedence over
 		// X-Forwarded-Proto and X-Forwarded-Host headers, and the
 		// hostname in the request.
-		context.urlBuilder = v2.NewURLBuilder(&app.httpHost, false)
+		if app.Config.HTTP.SubdomainNamespacing {
+			ns := dcontext.GetStringValue(ctx, "subdomain.namespace")
+			root := app.httpHost // copy
+			if ns != "" {
+				root.Host = ns + "." + app.httpHost.Host
+			}
+			nsSlash := ns + "/"
+			context.urlBuilder = v2.NewURLBuilderWithNameMapper(&root, false, func(name string) string {
+				return strings.TrimPrefix(name, nsSlash)
+			})
+		} else {
+			context.urlBuilder = v2.NewURLBuilder(&app.httpHost, false)
+		}
 	} else {
 		context.urlBuilder = v2.NewURLBuilderFromRequest(r, app.Config.HTTP.RelativeURLs)
 	}
 
 	return context
+}
+
+// extractSubdomainNamespace parses the namespace from the request Host header
+// relative to the configured base domain. Returns "" if subdomain namespacing
+// is disabled, the host has no single-label subdomain prefix, or the host does
+// not match the base domain.
+//
+// Example: base host = "registry.example.com", request host = "myns.registry.example.com" → "myns"
+func (app *App) extractSubdomainNamespace(r *http.Request) string {
+	if !app.Config.HTTP.SubdomainNamespacing {
+		return ""
+	}
+	baseDomain := app.httpHost.Host // e.g. "registry.example.com" or "registry.example.com:5000"
+	if baseDomain == "" {
+		return ""
+	}
+	baseHostOnly, _, _ := net.SplitHostPort(baseDomain)
+	if baseHostOnly == "" {
+		baseHostOnly = baseDomain
+	}
+	reqHostOnly, _, _ := net.SplitHostPort(r.Host)
+	if reqHostOnly == "" {
+		reqHostOnly = r.Host
+	}
+	suffix := "." + baseHostOnly
+	if !strings.HasSuffix(reqHostOnly, suffix) {
+		return ""
+	}
+	ns := reqHostOnly[:len(reqHostOnly)-len(suffix)]
+	if ns == "" || strings.Contains(ns, ".") {
+		return ""
+	}
+	return ns
 }
 
 // authorized checks if the request can proceed with access to the requested

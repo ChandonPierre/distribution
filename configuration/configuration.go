@@ -155,6 +155,14 @@ type HTTP struct {
 	// qualified URL.
 	Host string `yaml:"host,omitempty"`
 
+	// SubdomainNamespacing, when true, causes the registry to extract the
+	// repository namespace from the subdomain of the incoming request host
+	// rather than from the URL path. Requires http.host to be set to the
+	// base domain so the namespace can be computed by stripping it.
+	// Example: with host "https://registry.example.com", a request to
+	// "myns.registry.example.com/v2/repo/..." is treated as "myns/repo".
+	SubdomainNamespacing bool `yaml:"subdomainnamespacing,omitempty"`
+
 	// Prefix specifies a URL path prefix for the HTTP interface.
 	// This can be used to serve the registry under a specific path
 	// rather than at the root of the domain (e.g., "/registry").

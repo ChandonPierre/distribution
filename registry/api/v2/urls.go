@@ -18,9 +18,10 @@ import (
 // under "/foo/v2/...". Most application will only provide a schema, host and
 // port, such as "https://localhost:5000/".
 type URLBuilder struct {
-	root     *url.URL // url root (ie http://localhost/)
-	router   *mux.Router
-	relative bool
+	root       *url.URL // url root (ie http://localhost/)
+	router     *mux.Router
+	relative   bool
+	nameMapper func(string) string // nil means identity; used for subdomain namespacing
 }
 
 // NewURLBuilder creates a URLBuilder with provided root url object.
@@ -29,6 +30,19 @@ func NewURLBuilder(root *url.URL, relative bool) *URLBuilder {
 		root:     root,
 		router:   Router(),
 		relative: relative,
+	}
+}
+
+// NewURLBuilderWithNameMapper creates a URLBuilder like NewURLBuilder but
+// applies nameMapper to the "name" argument in all Build*URL calls. This is
+// used in subdomain-namespacing mode to strip the namespace prefix from
+// path-level URLs so responses contain just the repo component.
+func NewURLBuilderWithNameMapper(root *url.URL, relative bool, nameMapper func(string) string) *URLBuilder {
+	return &URLBuilder{
+		root:       root,
+		router:     Router(),
+		relative:   relative,
+		nameMapper: nameMapper,
 	}
 }
 
@@ -131,7 +145,7 @@ func (ub *URLBuilder) BuildCatalogURL(values ...url.Values) (string, error) {
 func (ub *URLBuilder) BuildTagsURL(name reference.Named, values ...url.Values) (string, error) {
 	route := ub.cloneRoute(RouteNameTags)
 
-	tagsURL, err := route.URL("name", name.Name())
+	tagsURL, err := route.URL("name", ub.mapName(name.Name()))
 	if err != nil {
 		return "", err
 	}
@@ -154,7 +168,7 @@ func (ub *URLBuilder) BuildManifestURL(ref reference.Named) (string, error) {
 		return "", fmt.Errorf("reference must have a tag or digest")
 	}
 
-	manifestURL, err := route.URL("name", ref.Name(), "reference", tagOrDigest)
+	manifestURL, err := route.URL("name", ub.mapName(ref.Name()), "reference", tagOrDigest)
 	if err != nil {
 		return "", err
 	}
@@ -166,7 +180,7 @@ func (ub *URLBuilder) BuildManifestURL(ref reference.Named) (string, error) {
 func (ub *URLBuilder) BuildBlobURL(ref reference.Canonical) (string, error) {
 	route := ub.cloneRoute(RouteNameBlob)
 
-	layerURL, err := route.URL("name", ref.Name(), "digest", ref.Digest().String())
+	layerURL, err := route.URL("name", ub.mapName(ref.Name()), "digest", ref.Digest().String())
 	if err != nil {
 		return "", err
 	}
@@ -179,7 +193,7 @@ func (ub *URLBuilder) BuildBlobURL(ref reference.Canonical) (string, error) {
 func (ub *URLBuilder) BuildBlobUploadURL(name reference.Named, values ...url.Values) (string, error) {
 	route := ub.cloneRoute(RouteNameBlobUpload)
 
-	uploadURL, err := route.URL("name", name.Name())
+	uploadURL, err := route.URL("name", ub.mapName(name.Name()))
 	if err != nil {
 		return "", err
 	}
@@ -194,12 +208,20 @@ func (ub *URLBuilder) BuildBlobUploadURL(name reference.Named, values ...url.Val
 func (ub *URLBuilder) BuildBlobUploadChunkURL(name reference.Named, uuid string, values ...url.Values) (string, error) {
 	route := ub.cloneRoute(RouteNameBlobUploadChunk)
 
-	uploadURL, err := route.URL("name", name.Name(), "uuid", uuid)
+	uploadURL, err := route.URL("name", ub.mapName(name.Name()), "uuid", uuid)
 	if err != nil {
 		return "", err
 	}
 
 	return appendValuesURL(uploadURL, values...).String(), nil
+}
+
+// mapName applies the nameMapper function if set, otherwise returns name unchanged.
+func (ub *URLBuilder) mapName(name string) string {
+	if ub.nameMapper != nil {
+		return ub.nameMapper(name)
+	}
+	return name
 }
 
 // cloneRoute returns a clone of the named route from the router. Routes

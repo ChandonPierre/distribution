@@ -41,6 +41,31 @@ func (ch *catalogHandler) GetCatalog(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	lastEntry := q.Get("last")
 
+	// In subdomain-namespacing mode, scope the catalog to the current namespace
+	// and translate the client-supplied pagination cursor into storage space.
+	if ns := getSubdomainNamespace(ch.Context); ns != "" {
+		if lastEntry != "" {
+			lastEntry = ns + "/" + lastEntry
+		}
+		existing := getCatalogPrefixes(ch.Context)
+		var scopedPrefixes []string
+		if existing == nil {
+			scopedPrefixes = []string{ns + "/"}
+		} else {
+			for _, p := range existing {
+				if strings.HasPrefix(p, ns+"/") {
+					scopedPrefixes = append(scopedPrefixes, p)
+				} else if p == ns || strings.HasPrefix(ns+"/", p) {
+					scopedPrefixes = append(scopedPrefixes, ns+"/")
+				}
+			}
+			if scopedPrefixes == nil {
+				scopedPrefixes = []string{} // non-nil empty = no repos visible
+			}
+		}
+		ch.Context.Context = withCatalogPrefixes(ch.Context.Context, scopedPrefixes)
+	}
+
 	entries := defaultReturnedEntries
 	maximumConfiguredEntries := ch.App.Config.Catalog.MaxEntries
 
@@ -141,6 +166,15 @@ func (ch *catalogHandler) GetCatalog(w http.ResponseWriter, r *http.Request) {
 			moreEntries = false
 		}
 		filled = returnedRepositories
+	}
+
+	// In subdomain-namespacing mode, strip the namespace prefix from returned
+	// repository names so clients see only the repo component.
+	if ns := getSubdomainNamespace(ch.Context); ns != "" {
+		nsSlash := ns + "/"
+		for i, repo := range repos[:filled] {
+			repos[i] = strings.TrimPrefix(repo, nsSlash)
+		}
 	}
 
 	w.Header().Set("Content-Type", "application/json")
