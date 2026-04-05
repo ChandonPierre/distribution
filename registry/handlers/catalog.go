@@ -41,6 +41,11 @@ func (ch *catalogHandler) GetCatalog(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	lastEntry := q.Get("last")
 
+	// catalogCacheKey is non-empty only when the result is cacheable:
+	//   - subdomain namespace mode with full namespace access (no per-user prefix filtering)
+	//   - global (non-namespaced) unpaginated request
+	var catalogCacheKey string
+
 	// In subdomain-namespacing mode, scope the catalog to the current namespace
 	// and translate the client-supplied pagination cursor into storage space.
 	if ns := getSubdomainNamespace(ch.Context); ns != "" {
@@ -51,6 +56,10 @@ func (ch *catalogHandler) GetCatalog(w http.ResponseWriter, r *http.Request) {
 		var scopedPrefixes []string
 		if existing == nil {
 			scopedPrefixes = []string{ns + "/"}
+			// Full namespace access: result is uniform per namespace and cacheable.
+			if lastEntry == "" {
+				catalogCacheKey = "ns::" + ns
+			}
 		} else {
 			for _, p := range existing {
 				if strings.HasPrefix(p, ns+"/") {
@@ -64,6 +73,21 @@ func (ch *catalogHandler) GetCatalog(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		ch.Context.Context = withCatalogPrefixes(ch.Context.Context, scopedPrefixes)
+	} else if lastEntry == "" {
+		// Non-namespaced, unpaginated: the full global catalog is cacheable.
+		catalogCacheKey = "global"
+	}
+
+	// Serve from the catalog cache when available.
+	if ch.App.appCache != nil && catalogCacheKey != "" {
+		if cached, _ := ch.App.appCache.GetCatalog(ch.Context, catalogCacheKey); cached != nil {
+			w.Header().Set("Content-Type", "application/json")
+			enc := json.NewEncoder(w)
+			if err := enc.Encode(catalogAPIResponse{Repositories: cached}); err != nil {
+				ch.Errors = append(ch.Errors, errcode.ErrorCodeUnknown.WithDetail(err))
+			}
+			return
+		}
 	}
 
 	entries := defaultReturnedEntries
@@ -175,6 +199,11 @@ func (ch *catalogHandler) GetCatalog(w http.ResponseWriter, r *http.Request) {
 		for i, repo := range repos[:filled] {
 			repos[i] = strings.TrimPrefix(repo, nsSlash)
 		}
+	}
+
+	// Populate the catalog cache when we have a complete (non-paginated) result.
+	if ch.App.appCache != nil && catalogCacheKey != "" && !moreEntries {
+		_ = ch.App.appCache.SetCatalog(ch.Context, catalogCacheKey, repos[:filled])
 	}
 
 	w.Header().Set("Content-Type", "application/json")
