@@ -361,6 +361,13 @@ func NewApp(ctx context.Context, config *configuration.Configuration) *App {
 			app.router.Path("/auth/token").Handler(te.TokenHandler())
 			dcontext.GetLogger(app).Infof("registered built-in token endpoint at /auth/token")
 		}
+
+		// Wrap with Redis-backed grant cache after token endpoint is registered,
+		// so the token endpoint route still points at the unwrapped controller.
+		if app.redis != nil {
+			app.accessController = wrapWithAuthCache(app.accessController, app.redis)
+			dcontext.GetLogger(app).Infof("redis auth grant cache enabled")
+		}
 	}
 
 	// configure as a pull through cache
