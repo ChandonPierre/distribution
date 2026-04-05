@@ -61,25 +61,41 @@ func (th *tagsHandler) GetTags(w http.ResponseWriter, r *http.Request) {
 	if limit == 0 {
 		moreEntries = false
 	} else {
-		tagService := th.Repository.Tags(th)
-		// if limit is -1, we want to list all the tags, and receive a io.EOF error
-		returnedTags, err := tagService.List(th.Context, limit, lastEntry)
-		if err != nil {
-			if err != io.EOF {
-				switch err := err.(type) {
-				case distribution.ErrRepositoryUnknown:
-					th.Errors = append(th.Errors, errcode.ErrorCodeNameUnknown.WithDetail(map[string]string{"name": th.Repository.Named().Name()}))
-				case errcode.Error:
-					th.Errors = append(th.Errors, err)
-				default:
-					th.Errors = append(th.Errors, errcode.ErrorCodeUnknown.WithDetail(err))
-				}
-				return
+		// For an unpaginated full listing, serve from the tag list cache when available.
+		cacheEligible := th.App.appCache != nil && limit == -1 && lastEntry == ""
+		cacheHit := false
+		if cacheEligible {
+			if cached, _ := th.App.appCache.GetTagList(th.Context, th.Repository.Named().Name()); cached != nil {
+				filled = cached
+				moreEntries = false
+				cacheHit = true
 			}
-			// err is either io.EOF
-			moreEntries = false
 		}
-		filled = returnedTags
+		if !cacheHit {
+			tagService := th.Repository.Tags(th)
+			// if limit is -1, we want to list all the tags, and receive a io.EOF error
+			returnedTags, err := tagService.List(th.Context, limit, lastEntry)
+			if err != nil {
+				if err != io.EOF {
+					switch err := err.(type) {
+					case distribution.ErrRepositoryUnknown:
+						th.Errors = append(th.Errors, errcode.ErrorCodeNameUnknown.WithDetail(map[string]string{"name": th.Repository.Named().Name()}))
+					case errcode.Error:
+						th.Errors = append(th.Errors, err)
+					default:
+						th.Errors = append(th.Errors, errcode.ErrorCodeUnknown.WithDetail(err))
+					}
+					return
+				}
+				// err is either io.EOF
+				moreEntries = false
+			}
+			filled = returnedTags
+			// Populate the tag list cache when we got the complete listing.
+			if cacheEligible && !moreEntries {
+				_ = th.App.appCache.SetTagList(th.Context, th.Repository.Named().Name(), filled)
+			}
+		}
 	}
 
 	w.Header().Set("Content-Type", "application/json")
