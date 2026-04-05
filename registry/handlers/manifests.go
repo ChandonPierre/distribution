@@ -117,22 +117,50 @@ func (imh *manifestHandler) GetManifest(w http.ResponseWriter, r *http.Request) 
 	}
 
 	if imh.Tag != "" {
-		tags := imh.Repository.Tags(imh)
-		desc, err := tags.Get(imh, imh.Tag)
-		if err != nil {
-			if _, ok := err.(distribution.ErrTagUnknown); ok {
-				imh.Errors = append(imh.Errors, errcode.ErrorCodeManifestUnknown.WithDetail(err))
-			} else {
-				imh.Errors = append(imh.Errors, errcode.ErrorCodeUnknown.WithDetail(err))
+		// Check tag→digest cache before hitting storage.
+		if c := imh.App.appCache; c != nil {
+			if cached, _ := c.GetTag(imh, imh.Repository.Named().Name(), imh.Tag); cached != "" {
+				imh.Digest = cached
 			}
-			return
 		}
-		imh.Digest = desc.Digest
+		if imh.Digest == "" {
+			tags := imh.Repository.Tags(imh)
+			desc, err := tags.Get(imh, imh.Tag)
+			if err != nil {
+				if _, ok := err.(distribution.ErrTagUnknown); ok {
+					imh.Errors = append(imh.Errors, errcode.ErrorCodeManifestUnknown.WithDetail(err))
+				} else {
+					imh.Errors = append(imh.Errors, errcode.ErrorCodeUnknown.WithDetail(err))
+				}
+				return
+			}
+			imh.Digest = desc.Digest
+			// Populate tag→digest cache.
+			if c := imh.App.appCache; c != nil {
+				_ = c.SetTag(imh, imh.Repository.Named().Name(), imh.Tag, imh.Digest)
+			}
+		}
 	}
 
 	if etagMatch(r, imh.Digest.String()) {
 		w.WriteHeader(http.StatusNotModified)
 		return
+	}
+
+	// Check manifest content cache before fetching from storage.
+	if c := imh.App.appCache; c != nil {
+		if ct, payload, _ := c.GetManifest(imh, imh.Digest); len(payload) > 0 {
+			w.Header().Set("Content-Type", ct)
+			w.Header().Set("Content-Length", fmt.Sprint(len(payload)))
+			w.Header().Set("Docker-Content-Digest", imh.Digest.String())
+			w.Header().Set("Etag", fmt.Sprintf(`"%s"`, imh.Digest))
+			if r.Method != http.MethodHead {
+				_, _ = w.Write(payload)
+			} else {
+				w.WriteHeader(http.StatusOK)
+			}
+			return
+		}
 	}
 
 	var options []distribution.ManifestServiceOption
@@ -211,6 +239,12 @@ func (imh *manifestHandler) GetManifest(w http.ResponseWriter, r *http.Request) 
 	ct, p, err := manifest.Payload()
 	if err != nil {
 		return
+	}
+
+	// Populate manifest content cache (only simple manifests — not rewritten
+	// manifests whose digest may differ from the stored one).
+	if c := imh.App.appCache; c != nil {
+		_ = c.SetManifest(imh, imh.Digest, ct, p)
 	}
 
 	w.Header().Set("Content-Type", ct)
@@ -337,7 +371,12 @@ func (imh *manifestHandler) PutManifest(w http.ResponseWriter, r *http.Request) 
 			imh.Errors = append(imh.Errors, errcode.ErrorCodeUnknown.WithDetail(err))
 			return
 		}
-
+		// Populate tag→digest cache and invalidate the tag list so the new
+		// tag appears on the next list request.
+		if c := imh.App.appCache; c != nil {
+			_ = c.SetTag(imh, imh.Repository.Named().Name(), imh.Tag, imh.Digest)
+			_ = c.InvalidateTagList(imh, imh.Repository.Named().Name())
+		}
 	}
 
 	// Construct a canonical url for the uploaded manifest.
@@ -448,6 +487,10 @@ func (imh *manifestHandler) DeleteManifest(w http.ResponseWriter, r *http.Reques
 			}
 			return
 		}
+		if c := imh.App.appCache; c != nil {
+			_ = c.DeleteTag(imh, imh.Repository.Named().Name(), imh.Tag)
+			_ = c.InvalidateTagList(imh, imh.Repository.Named().Name())
+		}
 		w.WriteHeader(http.StatusAccepted)
 		return
 	}
@@ -477,6 +520,11 @@ func (imh *manifestHandler) DeleteManifest(w http.ResponseWriter, r *http.Reques
 		}
 	}
 
+	// Evict the manifest from the cache.
+	if c := imh.App.appCache; c != nil {
+		_ = c.DeleteManifest(imh, imh.Digest)
+	}
+
 	tagService := imh.Repository.Tags(imh)
 	referencedTags, err := tagService.Lookup(imh, v1.Descriptor{Digest: imh.Digest})
 	if err != nil {
@@ -498,11 +546,19 @@ func (imh *manifestHandler) DeleteManifest(w http.ResponseWriter, r *http.Reques
 				errs = append(errs, err)
 				mu.Unlock()
 			}
+			// Evict tag→digest and tag list caches for each untagged entry.
+			if c := imh.App.appCache; c != nil {
+				_ = c.DeleteTag(imh, imh.Repository.Named().Name(), tag)
+			}
 			return nil
 		})
 	}
 	_ = g.Wait() // imh will record all errors, so ignore the error of Wait()
 	imh.Errors = errs
+
+	if c := imh.App.appCache; c != nil {
+		_ = c.InvalidateTagList(imh, imh.Repository.Named().Name())
+	}
 
 	w.WriteHeader(http.StatusAccepted)
 }
