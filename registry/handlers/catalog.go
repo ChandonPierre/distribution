@@ -39,6 +39,23 @@ func (ch *catalogHandler) GetCatalog(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	lastEntry := q.Get("last")
 
+	// catalogCacheKey is non-empty only when the result is cacheable:
+	//   - global (non-namespaced) unpaginated request
+	var catalogCacheKey string
+	catalogCacheKey = "global"
+
+	// Serve from the catalog cache when available.
+	if ch.App.appCache != nil && catalogCacheKey != "" {
+		if cached, _ := ch.App.appCache.GetCatalog(ch.Context, catalogCacheKey); cached != nil {
+			w.Header().Set("Content-Type", "application/json")
+			enc := json.NewEncoder(w)
+			if err := enc.Encode(catalogAPIResponse{Repositories: cached}); err != nil {
+				ch.Errors = append(ch.Errors, errcode.ErrorCodeUnknown.WithDetail(err))
+			}
+			return
+		}
+	}
+
 	entries := defaultReturnedEntries
 	maximumConfiguredEntries := ch.App.Config.Catalog.MaxEntries
 
@@ -82,6 +99,11 @@ func (ch *catalogHandler) GetCatalog(w http.ResponseWriter, r *http.Request) {
 			moreEntries = false
 		}
 		filled = returnedRepositories
+	}
+
+	// Populate the catalog cache when we have a complete (non-paginated) result.
+	if ch.App.appCache != nil && catalogCacheKey != "" && !moreEntries {
+		_ = ch.App.appCache.SetCatalog(ch.Context, catalogCacheKey, repos[:filled])
 	}
 
 	w.Header().Set("Content-Type", "application/json")
