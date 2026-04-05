@@ -79,7 +79,8 @@ type App struct {
 		source notifications.SourceRecord
 	}
 
-	redis redis.UniversalClient
+	redis    redis.UniversalClient
+	appCache *rediscache.AppCache // nil when Redis is not configured
 
 	// isCache is true if this registry is configured as a pull through cache
 	isCache bool
@@ -164,6 +165,10 @@ func NewApp(ctx context.Context, config *configuration.Configuration) *App {
 	}
 	app.configureEvents(config)
 	app.configureRedis(config)
+	if app.redis != nil {
+		app.appCache = rediscache.NewAppCache(app.redis)
+		dcontext.GetLogger(app).Infof("redis app cache enabled (manifests, tags, catalog)")
+	}
 	app.configureLogHook(config)
 
 	options := registrymiddleware.GetRegistryOptions()
