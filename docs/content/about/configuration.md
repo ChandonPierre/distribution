@@ -777,6 +777,9 @@ Each entry in `policies` has the following fields:
 | `expression`                | CEL boolean expression. Access is granted if any policy returns `true` (first-match). |
 | `catalog_prefix`            | Static repository name prefix. When set, the token endpoint probes this policy with the given prefix at token issuance; if access is granted, the prefix is embedded in the registry JWT's `catalog_prefixes` claim and used to filter `/v2/_catalog` responses. |
 | `catalog_prefix_expression` | CEL expression evaluated against the token map that must return a non-empty string. The result is used as the catalog prefix, allowing the tenant namespace to be derived dynamically from a JWT claim (e.g. `token["kubernetes.io/serviceaccount/namespace"]`). Takes precedence over `catalog_prefix` when both are set. |
+| `catalog_full_access`       | If `true`, a matching principal sees all repositories in `/v2/_catalog` (no prefix filtering). Takes precedence over `catalog_prefix` and `catalog_prefix_expression`. |
+| `namespace_create`          | If `true`, a matching principal may call `PUT /management/namespaces/{name}` to provision a new namespace bucket. The namespace name is available as `request["repository"]` so the expression can restrict which names are allowed. |
+| `namespace_delete`          | If `true`, a matching principal may call `DELETE /management/namespaces/{name}` to remove a namespace bucket. The namespace name is available as `request["repository"]`. |
 
 CEL variables available in each expression:
 
@@ -785,9 +788,11 @@ CEL variables available in each expression:
 | `token["iss"]`       | `string`        | JWT `iss` claim (OIDC issuer URL). |
 | `token["sub"]`       | `string`        | JWT `sub` claim (e.g. `system:serviceaccount:ns:sa`). |
 | `token["aud"]`       | `list(string)`  | JWT `aud` claim. |
-| `request["repository"]` | `string`     | Repository name being accessed (e.g. `myorg/myimage`). |
-| `request["actions"]` | `list(string)`  | Actions requested (e.g. `["pull"]`, `["pull","push"]`). |
-| `request["type"]`    | `string`        | Resource type, usually `"repository"`. |
+| `token["groups"]`    | `list(string)`  | Group memberships from the JWT (if present). |
+| `token["org_id"]`    | `string`        | Tenant organisation identifier injected from the `X-Org-Id` header returned by the JWKS endpoint. Empty string when the header is absent. |
+| `request["type"]`    | `string`        | Resource type. See [Policy request context](#policy-request-context). |
+| `request["repository"]` | `string`     | Resource name. See [Policy request context](#policy-request-context). |
+| `request["actions"]` | `list(string)`  | Single-element list with the action being evaluated. See [Policy request context](#policy-request-context). |
 
 ```yaml
 auth:
@@ -808,6 +813,18 @@ auth:
         expression: |
           token["sub"].startsWith("system:serviceaccount:") &&
           request["actions"] == ["pull"]
+      - name: org-admins-full-catalog
+        expression: '"admins" in token["groups"]'
+        catalog_full_access: true
+        namespace_create: true
+        namespace_delete: true
+      - name: org-scoped-namespace-create
+        # Principals may only create namespaces whose name starts with their
+        # org_id, preventing cross-tenant bucket creation.
+        expression: |
+          token["org_id"] != "" &&
+          request["repository"].startsWith(token["org_id"])
+        namespace_create: true
 ```
 
 ### `coreweave`
@@ -840,8 +857,8 @@ Each entry in `policies` has the following fields:
 | `catalog_prefix`            | Static prefix for `/v2/_catalog` filtering. |
 | `catalog_prefix_expression` | CEL expression that returns a string prefix (e.g. `principal["uid"]`). Takes precedence over `catalog_prefix`. |
 | `catalog_full_access`       | If `true`, a matching principal sees all repositories in `/v2/_catalog`. |
-| `namespace_create`          | If `true`, a matching principal may call `PUT /management/namespaces/{name}`. |
-| `namespace_delete`          | If `true`, a matching principal may call `DELETE /management/namespaces/{name}`. |
+| `namespace_create`          | If `true`, a matching principal may call `PUT /management/namespaces/{name}`. The namespace name is available as `request["repository"]` so the expression can restrict which names are allowed. |
+| `namespace_delete`          | If `true`, a matching principal may call `DELETE /management/namespaces/{name}`. The namespace name is available as `request["repository"]`. |
 
 CEL variables available in each expression:
 
@@ -851,6 +868,9 @@ CEL variables available in each expression:
 | `principal["org_uid"]`          | `string`       | Organisation identifier. |
 | `principal["groups"]`           | `list(string)` | Group memberships. |
 | `principal["console_actions"]`  | `list(string)` | Permitted console actions. |
+| `request["type"]`               | `string`       | Resource type. See [Policy request context](#policy-request-context). |
+| `request["repository"]`         | `string`       | Resource name. See [Policy request context](#policy-request-context). |
+| `request["actions"]`            | `list(string)` | Single-element list with the action being evaluated. See [Policy request context](#policy-request-context). |
 
 ```yaml
 auth:
@@ -871,6 +891,13 @@ auth:
         catalog_full_access: true
         namespace_create: true
         namespace_delete: true
+      - name: org-scoped-namespace-create
+        # Principals may only create namespaces whose name starts with their
+        # org_uid, preventing cross-tenant bucket creation.
+        expression: |
+          principal["org_uid"] != "" &&
+          request["repository"].startsWith(principal["org_uid"])
+        namespace_create: true
 ```
 
 ### `chain`
@@ -910,6 +937,61 @@ auth:
         redis_url: redis://localhost:6379
         policy_file: /etc/registry/cw-policy.yaml
 ```
+
+### Policy request context
+
+Both `kubeoidc` and `coreweave` evaluate CEL expressions against two maps:
+the identity map (`token` or `principal`) and a `request` map that describes
+the specific operation being authorised. The `request` map has the same
+structure for both providers.
+
+#### `request["type"]`
+
+Identifies the kind of resource being accessed.
+
+| Value | When |
+|---|---|
+| `"repository"` | Any image pull, push, or tag operation against `/v2/<name>/...` |
+| `"registry"` | A `/v2/_catalog` listing request |
+| `"namespace"` | A management API call (`PUT` or `DELETE /management/namespaces/{name}`) |
+
+#### `request["repository"]`
+
+The full name of the resource. Its meaning depends on `request["type"]`:
+
+| `type` | Value | Example |
+|---|---|---|
+| `"repository"` | Full repository path | `"myorg/myimage"` |
+| `"registry"` | Empty string | `""` |
+| `"namespace"` | Namespace name being provisioned or removed | `"myorg"` |
+
+#### `request["actions"]`
+
+A list containing the single action being evaluated. Policies are always
+tested one action at a time even when a client requests multiple actions in one
+scope string (e.g. `repository:img:pull,push`).
+
+| Value | Operation |
+|---|---|
+| `["pull"]` | Read a manifest or blob |
+| `["push"]` | Write a manifest or blob |
+| `["*"]` | Catalog listing |
+| `["create"]` | `PUT /management/namespaces/{name}` |
+| `["delete"]` | `DELETE /management/namespaces/{name}` |
+
+#### CEL string functions
+
+Both environments include the CEL [strings extension
+library](https://github.com/google/cel-go/blob/master/ext/strings.go).
+Commonly useful functions:
+
+| Function | Example |
+|---|---|
+| `startsWith(prefix)` | `request["repository"].startsWith(token["org_id"])` |
+| `endsWith(suffix)` | `token["sub"].endsWith(":my-sa")` |
+| `contains(substr)` | `"admin" in token["groups"]` |
+| `split(sep)` | `token["sub"].split(":")[2] == "myns"` |
+| `lowerAscii()` | `request["repository"].lowerAscii().startsWith("dev-")` |
 
 ## `middleware`
 
@@ -1131,6 +1213,13 @@ middleware:
         # Redirect vs proxy: if X-Direct-To-S3 is present, send 307 to presigned URL.
         # Omit this option to always proxy through the registry.
         redirectheader: X-Direct-To-S3
+
+        # Presigned URL endpoint (optional): when redirectheader triggers a redirect
+        # and no endpointheader is present, use this endpoint to generate the
+        # presigned URL instead of the normal S3 endpoint.
+        presignendpoint:
+          regionendpoint: https://public-s3.example.com
+          # accesskey/secretkey can also be overridden here for a separate IAM role
 ```
 
 | Parameter | Required | Description |
@@ -1138,11 +1227,43 @@ middleware:
 | `endpointheader` | no | The HTTP request header whose value selects the named endpoint block (e.g. `X-Storage-Region`). If absent or empty, the base S3 params are used. |
 | `endpoints` | no | A map of named endpoint override blocks. Each key is a header value; the value is a map of S3 parameters that override the base params for that endpoint. The `bucket` key is forbidden inside an endpoint block — it is always set to the namespace name. |
 | `redirectheader` | no | If set, the named HTTP request header controls whether blobs are served via redirect or proxy. When the header is **present** on a GET/HEAD request the client receives an HTTP 307 redirect to a presigned S3 URL and downloads directly from S3. When the header is **absent** the registry proxies the bytes. Omit this option (the default) to always proxy. |
+| `presignendpoint` | no | S3 parameter overrides used exclusively for presigned URL generation. When set and `redirectheader` is configured, requests on the default (no `endpointheader`) path generate presigned URLs from a second S3 driver pointed at this endpoint. Useful when the internal S3 endpoint used for proxying is not reachable by external clients. Any S3 parameter accepted by the base config is valid here (`regionendpoint`, `accesskey`, `secretkey`, etc.). When a named endpoint is selected via `endpointheader`, that endpoint is used for both normal traffic and presigned URLs — `presignendpoint` is not applied. |
 
 When the header is absent or its value does not match any configured endpoint
 key, the request falls back to the base S3 parameters. Each unique
 `(namespace, endpoint)` pair is cached as a separate S3 driver instance within
 the LRU cache.
+
+**Namespace management API:**
+
+When `namespaceds3` is active, the registry exposes a management API for
+provisioning namespace buckets. These endpoints are separate from the OCI
+`/v2/` data plane and require an authenticated request with the appropriate
+policy flag set.
+
+| Method   | Path                              | Description |
+|----------|-----------------------------------|-------------|
+| `PUT`    | `/management/namespaces/{name}`   | Create the S3 bucket for namespace `{name}`. Idempotent — if the bucket already exists and belongs to the configured AWS account, the call succeeds. Returns `201 Created` on success, `409 Conflict` if the bucket is owned by a different account. |
+| `DELETE` | `/management/namespaces/{name}`   | Delete the S3 bucket for namespace `{name}`. Returns `204 No Content` on success, `409 Conflict` if the bucket is non-empty, `404 Not Found` if the bucket does not exist. |
+
+Authorization follows the same auth provider as the rest of the registry.
+With `kubeoidc` or `coreweave`, the requesting principal must match a policy
+that has `namespace_create: true` or `namespace_delete: true` respectively.
+The target namespace name is exposed as `request["repository"]` inside the
+policy expression, allowing fine-grained name validation. For example, to
+restrict a principal to only creating namespaces that start with their org ID:
+
+```yaml
+- name: org-scoped-namespace-create
+  expression: |
+    token["org_id"] != "" &&
+    request["repository"].startsWith(token["org_id"])
+  namespace_create: true
+```
+
+Namespace names must be 3–63 characters, consist of lowercase letters, digits,
+and hyphens only, and must not start or end with a hyphen or contain
+consecutive hyphens (these are S3 bucket naming rules).
 
 ## `http`
 
@@ -1456,13 +1577,22 @@ The `events` structure configures the information provided in event notification
 
 ## `redis`
 
-Declare parameters for constructing the `redis` connections. Registry instances
-may use the Redis instance for several applications. Currently, it caches
-information about immutable blobs. Most of the `redis` options control
-how the registry connects to the `redis` instance.
+Declare parameters for constructing the `redis` connections. When Redis is
+configured, the registry uses it for several caching layers:
+
+| Cache | Description | TTL |
+|-------|-------------|-----|
+| Blob descriptor cache | Layer metadata (digest → size/media-type). Enables `blobdescriptor: redis` in `storage`. | None (evicted by allkeys-lru) |
+| Auth grant cache | Caches successful authorization results keyed by `hash(token + scope)`. On a cache hit the auth provider is bypassed entirely, eliminating repeated JWT verification or WhoAmI calls. | Derived from the token's `exp` claim (minus a 30-second safety margin). Defaults to `5m` when the expiry cannot be parsed. |
+| Manifest content cache | Caches manifest bytes and media type keyed by digest. Content-addressed, so entries are immutable once written. | None |
+| Tag-to-digest cache | Maps `(repository, tag)` → digest. | None |
+| Tag-list cache | Caches the full tag list per repository. | 60 seconds |
+| Catalog cache | Caches `/v2/_catalog` page results. | 5 minutes |
+| WhoAmI response cache | Used by the `coreweave` auth provider to avoid redundant API calls. See `whoami_cache_ttl` and `whoami_stale_ttl`. | Configurable (default fresh: `5m`, stale: `1h`) |
 
 You **must** configure Redis with the **allkeys-lru** eviction policy, because
-the registry does not set an expiration value on keys.
+most cache entries do not carry an explicit TTL and rely on LRU eviction to
+bound memory use.
 
 Under the hood distribution uses [`go-redis`](https://github.com/redis/go-redis) Go module for
 Redis connectivity and its [`UniversalOptions`](https://pkg.go.dev/github.com/redis/go-redis/v9#UniversalOptions)
