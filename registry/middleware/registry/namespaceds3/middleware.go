@@ -55,14 +55,17 @@ func init() {
 // Optionally, a request header selects a named S3 endpoint config, allowing
 // different endpoints (and credentials) per request while keeping bucket=namespace.
 // A separate redirectheader option enables per-request redirect vs proxy selection.
+// When presignendpoint is configured, presigned URL generation uses a second S3
+// driver built from those overrides instead of the normal endpoint.
 type namespacedS3Registry struct {
 	distribution.Namespace // fallback for non-namespace / single-component names
 
-	s3Params       map[string]any            // base S3 params (no bucket, no endpoint overrides)
-	registryOpts   []storage.RegistryOption
-	endpointHeader string                    // request header name for endpoint selection, e.g. "X-Storage-Region"
-	endpoints      map[string]map[string]any // named endpoint param overrides keyed by header value
-	redirectHeader string                    // if set, presence of this header on a request triggers S3 redirect
+	s3Params        map[string]any            // base S3 params (no bucket, no endpoint overrides)
+	registryOpts    []storage.RegistryOption
+	endpointHeader  string                    // request header name for endpoint selection, e.g. "X-Storage-Region"
+	endpoints       map[string]map[string]any // named endpoint param overrides keyed by header value
+	redirectHeader  string                    // if set, presence of this header on a request triggers S3 redirect
+	presignEndpoint map[string]any            // param overrides applied to the presigned-URL driver (default path only)
 
 	cache *lruCache
 }
@@ -123,6 +126,21 @@ func newNamespacedS3Registry(
 	// Parse redirect-vs-proxy header config.
 	redirectHeader, _ := options["redirectheader"].(string)
 
+	// Parse presign endpoint overrides. When set, presigned URL generation uses
+	// a separate S3 driver built from these params merged on top of the base
+	// params. Only applies on the default (no endpointheader) request path.
+	var presignEndpoint map[string]any
+	if v, ok := options["presignendpoint"]; ok {
+		raw, ok := v.(map[string]any)
+		if !ok {
+			return nil, fmt.Errorf("namespaceds3: presignendpoint must be a map")
+		}
+		if _, hasBucket := raw["bucket"]; hasBucket {
+			return nil, fmt.Errorf("namespaceds3: presignendpoint must not set 'bucket'")
+		}
+		presignEndpoint = raw
+	}
+
 	// Strip middleware-only keys before passing params to the S3 driver factory.
 	// The S3 driver ignores unknown keys rather than erroring, so these deletes
 	// are not strictly required for correctness. They are defensive: s3Params is
@@ -138,6 +156,7 @@ func newNamespacedS3Registry(
 	delete(s3Params, "endpointheader")
 	delete(s3Params, "endpoints")
 	delete(s3Params, "redirectheader")
+	delete(s3Params, "presignendpoint")
 
 	// If redirect-header routing is configured, enable the redirect path on all
 	// per-namespace registries. The conditionalRedirectDriver wrapper then gates
@@ -148,13 +167,14 @@ func newNamespacedS3Registry(
 	}
 
 	nsReg := &namespacedS3Registry{
-		Namespace:      registry,
-		s3Params:       s3Params,
-		registryOpts:   registryOpts,
-		endpointHeader: endpointHeader,
-		endpoints:      endpoints,
-		redirectHeader: redirectHeader,
-		cache:          newLRUCache(maxSize),
+		Namespace:       registry,
+		s3Params:        s3Params,
+		registryOpts:    registryOpts,
+		endpointHeader:  endpointHeader,
+		endpoints:       endpoints,
+		redirectHeader:  redirectHeader,
+		presignEndpoint: presignEndpoint,
+		cache:           newLRUCache(maxSize),
 	}
 
 	if purgeEnabled {
@@ -339,10 +359,24 @@ func (r *namespacedS3Registry) getOrCreate(ctx context.Context, ns string) (dist
 		if err != nil {
 			return nil, nil, fmt.Errorf("namespaceds3: creating S3 driver for %q/%q: %w", ns, endpointKey, err)
 		}
+
 		var drv storagedriver.StorageDriver = d
 		if r.redirectHeader != "" {
-			drv = &conditionalRedirectDriver{StorageDriver: d, header: r.redirectHeader}
+			crd := &conditionalRedirectDriver{StorageDriver: d, header: r.redirectHeader}
+			// When presignendpoint is configured and no named endpoint is in play,
+			// build a second S3 driver pointed at the presign endpoint so that
+			// RedirectURL uses different credentials/endpoint from normal traffic.
+			if len(r.presignEndpoint) > 0 && endpointKey == "" {
+				presignParams := r.presignParamsFor(ns, endpointKey)
+				pd, err := factory.Create(ctx, "s3aws", presignParams)
+				if err != nil {
+					return nil, nil, fmt.Errorf("namespaceds3: creating presign S3 driver for %q: %w", ns, err)
+				}
+				crd.presignDriver = pd
+			}
+			drv = crd
 		}
+
 		reg, err := storage.NewRegistry(ctx, drv, r.registryOpts...)
 		if err != nil {
 			return nil, nil, fmt.Errorf("namespaceds3: creating registry for %q/%q: %w", ns, endpointKey, err)
@@ -378,6 +412,19 @@ func (r *namespacedS3Registry) mergedParamsFor(ns, endpointKey string) map[strin
 		}
 	}
 	params["bucket"] = ns
+	return params
+}
+
+// presignParamsFor builds S3 driver parameters for presigned URL generation.
+// When a named endpoint is selected (endpointKey != ""), that endpoint already
+// handles both normal and presigned traffic — no extra override is applied.
+// On the default (no-header) path, presignEndpoint overrides are merged on top
+// of the base params to point presigned URLs at a different S3 endpoint.
+func (r *namespacedS3Registry) presignParamsFor(ns, endpointKey string) map[string]any {
+	params := r.mergedParamsFor(ns, endpointKey)
+	if endpointKey == "" && len(r.presignEndpoint) > 0 {
+		maps.Copy(params, r.presignEndpoint)
+	}
 	return params
 }
 
@@ -610,19 +657,27 @@ func (s *contextualBlobStatter) Stat(ctx context.Context, dgst digest.Digest) (d
 // --- Conditional redirect driver ---
 
 // conditionalRedirectDriver wraps a StorageDriver and gates redirect on the
-// presence of a request header. If the header is present (non-empty), the
-// underlying driver's RedirectURL is called, potentially returning a presigned
-// S3 URL that triggers an HTTP 307 redirect to the client. If the header is
-// absent, "" is returned and the blobserver falls back to proxying bytes
+// presence of a request header. If the header is present (non-empty), RedirectURL
+// is called on presignDriver (when configured) or the embedded StorageDriver,
+// potentially returning a presigned S3 URL that triggers an HTTP 307 redirect.
+// If the header is absent, "" is returned and the blobserver proxies bytes
 // through the registry. All other StorageDriver methods are promoted unchanged.
+//
+// presignDriver is non-nil when presignendpoint is configured and the default
+// (no endpointheader) path is in use. It points at a different S3 endpoint
+// and/or credentials optimised for generating public-facing presigned URLs.
 type conditionalRedirectDriver struct {
-	storagedriver.StorageDriver
-	header string
+	storagedriver.StorageDriver         // handles all normal storage operations
+	presignDriver storagedriver.StorageDriver // used only for RedirectURL; nil = use embedded driver
+	header        string
 }
 
 func (d *conditionalRedirectDriver) RedirectURL(r *http.Request, path string) (string, error) {
 	if r.Header.Get(d.header) == "" {
 		return "", nil // header absent → proxy
+	}
+	if d.presignDriver != nil {
+		return d.presignDriver.RedirectURL(r, path)
 	}
 	return d.StorageDriver.RedirectURL(r, path)
 }
