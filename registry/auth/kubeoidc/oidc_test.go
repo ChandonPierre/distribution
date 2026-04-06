@@ -299,6 +299,93 @@ func TestGetCacheWildcardIssuer(t *testing.T) {
 	}
 }
 
+func TestOrgIDStoredFromJWKSHeader(t *testing.T) {
+	key, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	jwk := jose.JSONWebKey{Key: key.Public(), KeyID: "kid", Algorithm: "ES256", Use: "sig"}
+	jwks := jose.JSONWebKeySet{Keys: []jose.JSONWebKey{jwk}}
+	jwksBytes, _ := json.Marshal(jwks)
+
+	const wantOrgID = "org-abc-123"
+	var serverURL string
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/.well-known/openid-configuration", func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(oidcDiscoveryDocument{Issuer: serverURL, JWKSURI: serverURL + "/keys"})
+	})
+	mux.HandleFunc("/keys", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("X-Org-Id", wantOrgID)
+		_, _ = w.Write(jwksBytes)
+	})
+	srv := httptest.NewServer(mux)
+	serverURL = srv.URL
+	t.Cleanup(srv.Close)
+
+	client := &http.Client{Timeout: 5 * time.Second}
+	cache, err := newJWKSCache(serverURL, time.Hour, client)
+	if err != nil {
+		t.Fatalf("newJWKSCache: %v", err)
+	}
+	if got := cache.getOrgID(); got != wantOrgID {
+		t.Errorf("getOrgID() = %q, want %q", got, wantOrgID)
+	}
+}
+
+func TestOrgIDEmptyWhenHeaderAbsent(t *testing.T) {
+	srv, _, issuer := setupMockOIDCServer(t) // does NOT set X-Org-Id
+	_ = srv
+
+	client := &http.Client{Timeout: 5 * time.Second}
+	cache, err := newJWKSCache(issuer, time.Hour, client)
+	if err != nil {
+		t.Fatalf("newJWKSCache: %v", err)
+	}
+	if got := cache.getOrgID(); got != "" {
+		t.Errorf("getOrgID() = %q, want empty string", got)
+	}
+}
+
+func TestOrgIDUpdatedOnRefresh(t *testing.T) {
+	key, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	jwk := jose.JSONWebKey{Key: key.Public(), KeyID: "kid", Algorithm: "ES256", Use: "sig"}
+	jwks := jose.JSONWebKeySet{Keys: []jose.JSONWebKey{jwk}}
+	jwksBytes, _ := json.Marshal(jwks)
+
+	orgID := "first-org"
+	var serverURL string
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/.well-known/openid-configuration", func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(oidcDiscoveryDocument{Issuer: serverURL, JWKSURI: serverURL + "/keys"})
+	})
+	mux.HandleFunc("/keys", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("X-Org-Id", orgID)
+		_, _ = w.Write(jwksBytes)
+	})
+	srv := httptest.NewServer(mux)
+	serverURL = srv.URL
+	t.Cleanup(srv.Close)
+
+	client := &http.Client{Timeout: 5 * time.Second}
+	cache, err := newJWKSCache(serverURL, time.Hour, client)
+	if err != nil {
+		t.Fatalf("newJWKSCache: %v", err)
+	}
+	if got := cache.getOrgID(); got != "first-org" {
+		t.Errorf("initial getOrgID() = %q, want %q", got, "first-org")
+	}
+
+	// Simulate the org ID changing on the server (e.g. issuer migration).
+	orgID = "second-org"
+	if err := cache.syncRefresh(); err != nil {
+		t.Fatalf("syncRefresh: %v", err)
+	}
+	if got := cache.getOrgID(); got != "second-org" {
+		t.Errorf("after refresh getOrgID() = %q, want %q", got, "second-org")
+	}
+}
+
 func TestGetCacheExactIssuerStillWorks(t *testing.T) {
 	srv, _, issuer := setupMockOIDCServer(t)
 	_ = srv

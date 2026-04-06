@@ -401,6 +401,13 @@ func (ac *accessController) Authorized(req *http.Request, accessItems ...auth.Ac
 		tokenMap["aud"] = toStringSlice(raw)
 	}
 
+	// Inject the X-Org-Id value from the JWKS endpoint response as a synthetic
+	// claim so policies can make decisions based on issuer-level org identity
+	// without encoding it in every token. Accessible as token["org_id"].
+	if orgID := cache.getOrgID(); orgID != "" {
+		tokenMap["org_id"] = orgID
+	}
+
 	// Load the current policy set atomically.
 	ps := ac.policySet.Load()
 

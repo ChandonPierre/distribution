@@ -473,6 +473,117 @@ func TestWWWAuthenticateHeader(t *testing.T) {
 	}
 }
 
+// TestOrgIDAvailableInPolicy verifies that the X-Org-Id header from the JWKS
+// endpoint is injected into the token map as "org_id" so CEL policies can use it.
+func TestOrgIDAvailableInPolicy(t *testing.T) {
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const kid = "test-kid"
+	const wantOrgID = "coreweave-prod"
+
+	jwk := jose.JSONWebKey{Key: key.Public(), KeyID: kid, Algorithm: "ES256", Use: "sig"}
+	jwks := jose.JSONWebKeySet{Keys: []jose.JSONWebKey{jwk}}
+
+	var issuer string
+	mux := http.NewServeMux()
+	mux.HandleFunc("/.well-known/openid-configuration", func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(oidcDiscoveryDocument{Issuer: issuer, JWKSURI: issuer + "/keys"})
+	})
+	mux.HandleFunc("/keys", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("X-Org-Id", wantOrgID)
+		_ = json.NewEncoder(w).Encode(jwks)
+	})
+	srv := httptest.NewServer(mux)
+	issuer = srv.URL
+	t.Cleanup(srv.Close)
+
+	const service = "registry.example.com"
+	options := map[string]any{
+		"realm":   issuer + "/auth",
+		"service": service,
+		"issuers": []any{issuer},
+		"policies": []any{
+			map[string]any{
+				"name":       "org-check",
+				"expression": fmt.Sprintf(`token["org_id"] == %q`, wantOrgID),
+			},
+		},
+	}
+	ctrl, err := newAccessController(options)
+	if err != nil {
+		t.Fatalf("newAccessController: %v", err)
+	}
+
+	now := time.Now()
+	claims := jwt.Claims{
+		Issuer:    issuer,
+		Subject:   "system:serviceaccount:ci:builder",
+		Audience:  jwt.Audience{service},
+		IssuedAt:  jwt.NewNumericDate(now),
+		NotBefore: jwt.NewNumericDate(now),
+		Expiry:    jwt.NewNumericDate(now.Add(time.Hour)),
+	}
+	sig, err := jose.NewSigner(
+		jose.SigningKey{Algorithm: jose.ES256, Key: key},
+		(&jose.SignerOptions{}).WithType("JWT").WithHeader("kid", kid),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rawToken, err := jwt.Signed(sig).Claims(claims).Serialize()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/v2/", nil)
+	req.Header.Set("Authorization", "Bearer "+rawToken)
+
+	grant, err := ctrl.Authorized(req, auth.Access{
+		Resource: auth.Resource{Type: "repository", Name: "ns/img"},
+		Action:   "pull",
+	})
+	if err != nil {
+		t.Fatalf("expected grant, got error: %v", err)
+	}
+	if grant == nil {
+		t.Fatal("expected non-nil grant")
+	}
+
+	// Now verify that a policy matching a different org_id correctly denies.
+	optionsDeny := map[string]any{
+		"realm":   issuer + "/auth",
+		"service": service,
+		"issuers": []any{issuer},
+		"policies": []any{
+			map[string]any{
+				"name":       "wrong-org",
+				"expression": `token["org_id"] == "wrong-org"`,
+			},
+		},
+	}
+	ctrlDeny, err := newAccessController(optionsDeny)
+	if err != nil {
+		t.Fatalf("newAccessController deny: %v", err)
+	}
+
+	req2 := httptest.NewRequest(http.MethodGet, "/v2/", nil)
+	req2.Header.Set("Authorization", "Bearer "+rawToken)
+
+	_, err = ctrlDeny.Authorized(req2, auth.Access{
+		Resource: auth.Resource{Type: "repository", Name: "ns/img"},
+		Action:   "pull",
+	})
+	if err == nil {
+		t.Fatal("expected denial when org_id does not match policy")
+	}
+	if _, ok := err.(auth.Challenge); !ok {
+		t.Fatalf("expected auth.Challenge, got %T: %v", err, err)
+	}
+}
+
 func contains(s, substr string) bool {
 	return len(s) >= len(substr) && (s == substr || len(s) > 0 && containsStr(s, substr))
 }

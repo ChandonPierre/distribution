@@ -31,6 +31,7 @@ type oidcDiscoveryDocument struct {
 type jwksCache struct {
 	mu           sync.RWMutex
 	keys         *jose.JSONWebKeySet
+	orgID        string // value of X-Org-Id header from the most recent JWKS fetch
 	fetchedAt    time.Time
 	refreshEvery time.Duration
 	httpClient   *http.Client
@@ -173,9 +174,18 @@ func (c *jwksCache) fetchAndStore() error {
 
 	c.mu.Lock()
 	c.keys = &keySet
+	c.orgID = resp.Header.Get("X-Org-Id")
 	c.fetchedAt = time.Now()
 	c.mu.Unlock()
 	return nil
+}
+
+// getOrgID returns the X-Org-Id value received during the most recent JWKS fetch.
+// Returns an empty string if the header was absent.
+func (c *jwksCache) getOrgID() string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.orgID
 }
 
 // getKeys returns the current JWKS. If the cache is stale, a background refresh is triggered.
