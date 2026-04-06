@@ -899,6 +899,147 @@ tags:
 | Parameter | Required | Description                                                                         |
 |-----------|----------|-------------------------------------------------------------------------------------|
 | `maxtags` | no       | Overrides the maximum number of tags returned by the tags endpoint, default: `1000` |
+### `namespaceds3`
+
+The `namespaceds3` middleware is a **registry** middleware (not a storage
+middleware) that routes each namespace to its own S3 bucket. The bucket name
+equals the namespace name. It is designed for use with
+[`subdomainnamespacing`](#subdomainnamespacing) but works with any setup where
+repository names have a namespace prefix (e.g. `myns/myapp`).
+
+**Two independent S3 configurations are required:**
+
+- `storage.s3aws` — the *base* bucket, used only for non-namespaced operations
+  (garbage collection, admin fallback). It must be present even when all normal
+  traffic goes through namespace buckets.
+- `middleware.registry.namespaceds3.options` — the *namespace* S3 config. This
+  is a completely separate S3 driver configuration used for all namespaced
+  requests. The middleware does **not** inherit from `storage.s3aws`; you must
+  specify credentials, region, endpoint, and any other S3 params here
+  explicitly. In most deployments these two blocks contain the same values.
+
+The `bucket` key must not appear in the middleware options; it is always derived
+from the namespace name. All other routing options (`redirectheader`,
+`endpointheader`, `presignendpoint`, etc.) are also scoped to the middleware
+config and have no relationship to the base storage driver settings.
+
+```yaml
+storage:
+  s3aws:
+    region: us-east-1
+    accesskey: AKIAIOSFODNN7EXAMPLE
+    secretkey: wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY
+    rootdirectory: /docker/registry/v2
+
+middleware:
+  registry:
+    - name: namespaceds3
+      options:
+        region: us-east-1
+        accesskey: AKIAIOSFODNN7EXAMPLE
+        secretkey: wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY
+        rootdirectory: /docker/registry/v2
+        maxcachesize: 256
+        purgeenabled: true
+        purgeage: 168h
+        purgeinterval: 24h
+        purgedryrun: false
+```
+
+**Basic options:**
+
+| Parameter | Required | Description |
+|-----------|----------|-------------|
+| `region` | yes | AWS region for all namespace buckets. |
+| `accesskey` | no | AWS access key ID. If omitted, the default credential chain is used. |
+| `secretkey` | no | AWS secret access key. |
+| `regionendpoint` | no | Custom S3-compatible endpoint URL (e.g. for MinIO or non-AWS providers). |
+| `rootdirectory` | no | Key prefix applied inside every bucket. |
+| `maxcachesize` | no | Maximum number of `(namespace, endpoint)` pairs to keep in the LRU driver cache. Defaults to `256`. |
+
+All other S3 driver parameters (e.g. `secure`, `chunksize`, `multipartcopyMaxConcurrency`) are accepted and forwarded to each namespace's S3 driver instance.
+
+**Upload purge options:**
+
+`namespaceds3` runs its own background upload purger because the main registry
+purger only covers the base storage driver, not namespace buckets.
+
+| Parameter | Required | Description |
+|-----------|----------|-------------|
+| `purgeenabled` | no | Whether to run the namespace upload purger. Defaults to `true`. |
+| `purgeage` | no | Purge uploads older than this duration. Accepts Go duration strings (e.g. `168h`). Defaults to `168h` (1 week). |
+| `purgeinterval` | no | How often to run a purge sweep across all cached namespace buckets. Defaults to `24h`. |
+| `purgedryrun` | no | If `true`, log what would be purged without deleting. Defaults to `false`. |
+
+**Garbage collection:**
+
+The `registry garbage-collect` CLI command instantiates a storage driver from
+the main registry config (the base S3 bucket). It has no knowledge of
+per-namespace buckets created by this middleware.
+
+To garbage-collect a namespace bucket you must run GC separately, targeting
+that bucket directly. The recommended approach is to invoke
+`registry garbage-collect` with a config file whose `storage.s3.bucket` points
+at the target namespace bucket. In a scripted environment, iterate over the set
+of known namespaces and run one GC pass per bucket:
+
+```sh
+for ns in myns-a myns-b myns-c; do
+  registry garbage-collect /etc/registry/gc-template.yml --bucket "$ns"
+done
+```
+
+> **Note:** Garbage collection reads S3 directly — it has no dependency on
+> Redis or any in-memory registry state. Registry and Redis restarts do not
+> affect GC correctness. S3 is the authoritative source of truth: the mark
+> phase walks all `repositories/*/` manifest link files in the target bucket;
+> the sweep phase removes any blob in `/blobs/sha256/` not reachable from those
+> manifests.
+
+**Per-request S3 endpoint routing:**
+
+You can route requests to different S3 endpoints based on an HTTP request
+header. This is useful when tenants are spread across multiple regions or
+storage providers while still mapping each namespace to its own bucket.
+
+```yaml
+middleware:
+  registry:
+    - name: namespaceds3
+      options:
+        # Base S3 params — used as the default for all requests
+        region: us-east-1
+        accesskey: AKIAIOSFODNN7EXAMPLE
+        secretkey: wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY
+        rootdirectory: /docker/registry/v2
+
+        # Endpoint routing
+        endpointheader: X-Storage-Region
+        endpoints:
+          us:
+            regionendpoint: https://s3.us-east-1.amazonaws.com
+            region: us-east-1
+          eu:
+            regionendpoint: https://s3.eu-west-1.amazonaws.com
+            region: eu-west-1
+            accesskey: eu-access-key
+            secretkey: eu-secret-key
+
+        # Redirect vs proxy: if X-Direct-To-S3 is present, send 307 to presigned URL.
+        # Omit this option to always proxy through the registry.
+        redirectheader: X-Direct-To-S3
+```
+
+| Parameter | Required | Description |
+|-----------|----------|-------------|
+| `endpointheader` | no | The HTTP request header whose value selects the named endpoint block (e.g. `X-Storage-Region`). If absent or empty, the base S3 params are used. |
+| `endpoints` | no | A map of named endpoint override blocks. Each key is a header value; the value is a map of S3 parameters that override the base params for that endpoint. The `bucket` key is forbidden inside an endpoint block — it is always set to the namespace name. |
+| `redirectheader` | no | If set, the named HTTP request header controls whether blobs are served via redirect or proxy. When the header is **present** on a GET/HEAD request the client receives an HTTP 307 redirect to a presigned S3 URL and downloads directly from S3. When the header is **absent** the registry proxies the bytes. Omit this option (the default) to always proxy. |
+
+When the header is absent or its value does not match any configured endpoint
+key, the request falls back to the base S3 parameters. Each unique
+`(namespace, endpoint)` pair is cached as a separate S3 driver instance within
+the LRU cache.
 
 ## `http`
 
@@ -911,6 +1052,7 @@ http:
   secret: asecretforlocaldevelopment
   relativeurls: false
   draintimeout: 60s
+  subdomainnamespacing: false
   tls:
     certificate: /path/to/x509/public
     key: /path/to/x509/private
@@ -949,7 +1091,49 @@ registry.
 | `secret`  | no       | A random piece of data used to sign state that may be stored with the client to protect against tampering. For production environments you should generate a random piece of data using a cryptographically secure random generator. If you omit the secret, the registry will automatically generate a secret when it starts. **If you are building a cluster of registries behind a load balancer, you MUST ensure the secret is the same for all registries.**|
 | `relativeurls`| no    | If `true`,  the registry returns relative URLs in Location headers. The client is responsible for resolving the correct URL. **This option is not compatible with Docker 1.7 and earlier.**|
 | `draintimeout`| no    | Amount of time to wait for HTTP connections to drain before shutting down after registry receives SIGTERM signal|
+| `subdomainnamespacing` | no | If `true`, enables subdomain-based namespacing. See [`subdomainnamespacing`](#subdomainnamespacing). |
 
+
+### `subdomainnamespacing`
+
+The `subdomainnamespacing` option is **optional**. When set to `true`, the
+registry extracts a namespace from the first subdomain label of the `Host`
+header and uses it to scope every request.
+
+```yaml
+http:
+  host: https://registry.example.com
+  subdomainnamespacing: true
+```
+
+In this mode a client connecting to `myns.registry.example.com` sees only the
+repositories that belong to the `myns` namespace:
+
+- `/v2/<repo>/...` paths are transparently prefixed with `myns/` server-side,
+  so clients use short names (`myapp`) without the namespace component.
+- `/v2/_catalog` returns only repositories whose names start with `myns/`, with
+  the prefix stripped from the response.
+- The built-in web UI at `/ui/` is automatically namespace-scoped when accessed
+  via a namespace subdomain.
+
+**Requirements:**
+
+- `http.host` **must** be set. The registry derives the base domain from this
+  value to distinguish the namespace subdomain from the rest of the hostname.
+  The registry panics at startup if `subdomainnamespacing` is `true` but `host`
+  is not configured.
+- For DNS wildcard routing, configure your DNS provider with an `A`/`CNAME`
+  record for `*.registry.example.com` pointing at the registry.
+
+**Interaction with `namespaceds3` middleware:**
+
+When used together with the `namespaceds3` registry middleware, each namespace
+subdomain is automatically routed to its own S3 bucket (bucket name equals the
+namespace name). See [`namespaceds3`](#namespaceds3) for details.
+
+| Parameter | Required | Description |
+|-----------|----------|-------------|
+| `subdomainnamespacing` | no | If `true`, the first subdomain label of the `Host` header is used as the repository namespace prefix. Defaults to `false`. |
 
 ### `tls`
 

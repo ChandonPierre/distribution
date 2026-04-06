@@ -148,14 +148,23 @@ For multi-access requests (e.g., a push that requires both `pull` and `push`), e
 
 #### Catalog prefix filtering
 
-Each policy may optionally carry a `catalog_prefix` or `catalog_prefix_expression` field. When present, the policy participates in `/v2/_catalog` multi-tenancy filtering:
+Each policy may optionally carry a `catalog_prefix`, `catalog_prefix_expression`, or `catalog_full_access` field. When present, the policy participates in `/v2/_catalog` multi-tenancy filtering:
 
-1. At token issuance, `catalogPrefixesForToken` iterates over policies that declare either field and resolves a prefix string for this specific token (see below).
-2. The union of resolved prefixes is embedded in the registry JWT as the `catalog_prefixes` claim (omitted when empty, to keep tokens compact).
+1. At token issuance, `catalogPrefixesForToken` iterates over policies that declare one of these fields and resolves the catalog access for this specific token (see below).
+2. The union of resolved prefixes is embedded in the registry JWT as the `catalog_prefixes` claim (omitted when empty, to keep tokens compact). A `catalog_full_access` match omits the claim entirely, signalling unrestricted access.
 3. When `Authorized()` validates a registry-issued token for a catalog request, it propagates `catalog_prefixes` from the JWT into `auth.Grant.CatalogPrefixes`.
-4. `GetCatalog` filters the repository list in memory, keeping only names that start with at least one of the granted prefixes.
+4. `GetCatalog` filters the repository list in memory, keeping only names that start with at least one of the granted prefixes. A nil `CatalogPrefixes` means no filtering.
 
-**Two resolution strategies:**
+**Three resolution strategies:**
+
+`catalog_full_access` (for admin/operator policies) — if `true` and the main policy expression matches, prefix filtering is bypassed entirely. The token carries no `catalog_prefixes` claim and the caller sees every repository in the registry. Takes precedence over the prefix strategies.
+
+```yaml
+- name: registry-admins
+  expression: |
+    token["sub"].startsWith("system:serviceaccount:registry-admin:")
+  catalog_full_access: true
+```
 
 `catalog_prefix_expression` (preferred for multi-tenant deployments) — a CEL expression evaluated against the token map that must return a non-empty string. The result is used directly as the prefix. This is the right choice when the tenant identifier lives in a JWT claim:
 
@@ -172,6 +181,7 @@ catalog_prefix: cw4637/
 ```
 
 A `nil` `CatalogPrefixes` value means no filtering (all repositories visible). This applies to:
+- Tokens issued to callers matching a `catalog_full_access: true` policy.
 - Direct SA token requests (the `Authorized()` OIDC path — a v1 limitation; these callers do not go through the token endpoint where prefix resolution occurs).
 - Non-kubeoidc deployments (`token`, `htpasswd`, etc.).
 
@@ -330,6 +340,12 @@ auth:
           "pull" in request["actions"]
         catalog_prefix: tenant-a/
 
+      # Full catalog access: registry admins see every repository.
+      - name: registry-admins
+        expression: |
+          token["sub"].startsWith("system:serviceaccount:registry-admin:")
+        catalog_full_access: true
+
     # OR: external policy file with live reload
     policy_file: /etc/registry/policies.yaml
     policy_reload_interval: 30s
@@ -352,6 +368,7 @@ auth:
 | `expression` | yes | CEL boolean expression; `true` = access granted |
 | `catalog_prefix` | no | Static repository name prefix for `/v2/_catalog` filtering. The main expression is probed with `request["repository"] = <prefix>` at token issuance; if granted, the prefix is embedded in `catalog_prefixes`. |
 | `catalog_prefix_expression` | no | CEL expression evaluated against the token map; must return a non-empty string used as the catalog prefix. Takes precedence over `catalog_prefix` when both are set. Use this when the tenant/org identifier is a JWT claim. |
+| `catalog_full_access` | no | If `true`, any token that satisfies the main policy expression receives an unrestricted `/v2/_catalog` view (no prefix filtering). The issued JWT carries no `catalog_prefixes` claim, so the catalog handler returns all repositories. Takes precedence over `catalog_prefix` and `catalog_prefix_expression`. Use this for admin or operator policies that need a global view of the registry. |
 
 ---
 
