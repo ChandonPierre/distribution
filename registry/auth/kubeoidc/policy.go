@@ -30,6 +30,14 @@ type compiledPolicy struct {
 	// catalogFullAccess, when true, grants unrestricted catalog access to any
 	// token matching the main expression (no prefix filtering).
 	catalogFullAccess bool
+
+	// namespaceCreate, when true, grants namespace:*:create to any token
+	// matching the main expression.
+	namespaceCreate bool
+
+	// namespaceDelete, when true, grants namespace:*:delete to any token
+	// matching the main expression.
+	namespaceDelete bool
 }
 
 // policySet is an atomically replaceable set of compiled CEL policies.
@@ -70,6 +78,8 @@ func compilePolicies(cfgs []policyConfig, env *cel.Env) ([]*compiledPolicy, erro
 			program:           prg,
 			catalogPrefix:     cfg.CatalogPrefix,
 			catalogFullAccess: cfg.CatalogFullAccess,
+			namespaceCreate:   cfg.NamespaceCreate,
+			namespaceDelete:   cfg.NamespaceDelete,
 		}
 		if cfg.CatalogPrefixExpression != "" {
 			pAst, pIss := env.Compile(cfg.CatalogPrefixExpression)
@@ -103,6 +113,49 @@ func evaluatePolicies(policies []*compiledPolicy, token, request map[string]any)
 		}
 	}
 	return false, nil
+}
+
+// namespaceCreateGranted reports whether any policy with namespace_create: true
+// has its main expression satisfied by the given token, granting the caller the
+// ability to create the named namespace via the management API.
+// namespaceName is set as request["repository"] so expressions can validate it
+// (e.g. request["repository"].startsWith(token["org_id"])).
+func namespaceCreateGranted(policies []*compiledPolicy, tokenMap map[string]any, namespaceName string) bool {
+	requestMap := map[string]any{
+		"type":       "namespace",
+		"repository": namespaceName,
+		"actions":    []string{"create"},
+	}
+	for _, p := range policies {
+		if !p.namespaceCreate {
+			continue
+		}
+		if granted, err := evaluatePolicies([]*compiledPolicy{p}, tokenMap, requestMap); err == nil && granted {
+			return true
+		}
+	}
+	return false
+}
+
+// namespaceDeleteGranted reports whether any policy with namespace_delete: true
+// has its main expression satisfied by the given token.
+// namespaceName is set as request["repository"] so expressions can restrict
+// which namespaces a principal is permitted to delete.
+func namespaceDeleteGranted(policies []*compiledPolicy, tokenMap map[string]any, namespaceName string) bool {
+	requestMap := map[string]any{
+		"type":       "namespace",
+		"repository": namespaceName,
+		"actions":    []string{"delete"},
+	}
+	for _, p := range policies {
+		if !p.namespaceDelete {
+			continue
+		}
+		if granted, err := evaluatePolicies([]*compiledPolicy{p}, tokenMap, requestMap); err == nil && granted {
+			return true
+		}
+	}
+	return false
 }
 
 // loadPolicyFile reads a YAML file and returns its policy list.

@@ -8,17 +8,24 @@ import (
 	"container/list"
 	"context"
 	"crypto/rand"
+	"crypto/tls"
 	"fmt"
 	"maps"
 	"math"
 	"math/big"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"golang.org/x/sync/singleflight"
 
+	"github.com/aws/aws-sdk-go/aws"
+	"github.com/aws/aws-sdk-go/aws/awserr"
+	"github.com/aws/aws-sdk-go/aws/credentials"
+	"github.com/aws/aws-sdk-go/aws/session"
+	"github.com/aws/aws-sdk-go/service/s3"
 	distribution "github.com/distribution/distribution/v3"
 	"github.com/distribution/distribution/v3/internal/dcontext"
 	registrymiddleware "github.com/distribution/distribution/v3/registry/middleware/registry"
@@ -374,6 +381,170 @@ func (r *namespacedS3Registry) mergedParamsFor(ns, endpointKey string) map[strin
 	return params
 }
 
+// CreateNamespace provisions an S3 bucket for the given namespace name.
+// If the bucket already exists and is owned by the configured AWS account,
+// the call is idempotent and returns nil.
+// Returns an error if the name is invalid, the bucket is owned by a different
+// account, or the AWS API call fails.
+// Implements registrymiddleware.NamespaceProvisioner.
+func (r *namespacedS3Registry) CreateNamespace(ctx context.Context, name string) error {
+	if err := validateNamespaceName(name); err != nil {
+		return err
+	}
+	endpointKey := r.endpointKeyFromCtx(ctx)
+	params := r.mergedParamsFor(name, endpointKey)
+
+	s3Client, err := buildS3Client(params)
+	if err != nil {
+		return fmt.Errorf("namespaceds3 CreateNamespace: %w", err)
+	}
+
+	input := &s3.CreateBucketInput{Bucket: aws.String(name)}
+	region, _ := params["region"].(string)
+	if region != "" && region != "us-east-1" {
+		// us-east-1 must NOT include LocationConstraint (AWS API requirement).
+		input.CreateBucketConfiguration = &s3.CreateBucketConfiguration{
+			LocationConstraint: aws.String(region),
+		}
+	}
+
+	_, err = s3Client.CreateBucketWithContext(ctx, input)
+	if isAlreadyOwnedByYou(err) {
+		return nil // idempotent — bucket exists and belongs to this account
+	}
+	return err
+}
+
+// DeleteNamespace removes the S3 bucket for the given namespace.
+// Returns ErrNamespaceNotEmpty if the bucket still contains objects, and
+// ErrNamespaceNotFound if the bucket does not exist.
+// Implements registrymiddleware.NamespaceProvisioner.
+func (r *namespacedS3Registry) DeleteNamespace(ctx context.Context, name string) error {
+	if err := validateNamespaceName(name); err != nil {
+		return err
+	}
+	endpointKey := r.endpointKeyFromCtx(ctx)
+	params := r.mergedParamsFor(name, endpointKey)
+
+	s3Client, err := buildS3Client(params)
+	if err != nil {
+		return fmt.Errorf("namespaceds3 DeleteNamespace: %w", err)
+	}
+
+	_, err = s3Client.DeleteBucketWithContext(ctx, &s3.DeleteBucketInput{Bucket: aws.String(name)})
+	if err != nil {
+		if ae, ok := err.(awserr.Error); ok {
+			switch ae.Code() {
+			case "BucketNotEmpty":
+				return registrymiddleware.ErrNamespaceNotEmpty{Name: name}
+			case "NoSuchBucket":
+				return registrymiddleware.ErrNamespaceNotFound{Name: name}
+			}
+		}
+		return fmt.Errorf("namespaceds3 DeleteNamespace: %w", err)
+	}
+
+	// Evict the cached registry entry so subsequent requests don't attempt to
+	// use a driver backed by the now-deleted bucket.
+	cacheKey := name + "\x00" + endpointKey
+	r.cache.evict(cacheKey)
+
+	return nil
+}
+
+// buildS3Client constructs an *s3.S3 client from a driver parameter map.
+// It reads the same keys as the s3-aws driver (accesskey, secretkey, region,
+// regionendpoint, secure, skipverify, forcepathstyle, sessiontoken).
+func buildS3Client(params map[string]any) (*s3.S3, error) {
+	accessKey, _ := params["accesskey"].(string)
+	secretKey, _ := params["secretkey"].(string)
+	sessionToken, _ := params["sessiontoken"].(string)
+	region, _ := params["region"].(string)
+	regionEndpoint, _ := params["regionendpoint"].(string)
+
+	awsConfig := aws.NewConfig()
+	if accessKey != "" && secretKey != "" {
+		awsConfig = awsConfig.WithCredentials(
+			credentials.NewStaticCredentials(accessKey, secretKey, sessionToken),
+		)
+	}
+	if regionEndpoint != "" {
+		awsConfig = awsConfig.WithEndpoint(regionEndpoint)
+	}
+	if region != "" {
+		awsConfig = awsConfig.WithRegion(region)
+	}
+
+	secure := parseBoolParam(params, "secure", true)
+	awsConfig = awsConfig.WithDisableSSL(!secure)
+
+	if parseBoolParam(params, "skipverify", false) {
+		awsConfig = awsConfig.WithHTTPClient(&http.Client{
+			Transport: &http.Transport{
+				TLSClientConfig: &tls.Config{InsecureSkipVerify: true}, //nolint:gosec
+			},
+		})
+	}
+
+	awsConfig = awsConfig.WithS3ForcePathStyle(parseBoolParam(params, "forcepathstyle", false))
+
+	sess, err := session.NewSession(awsConfig)
+	if err != nil {
+		return nil, fmt.Errorf("buildS3Client: new session: %w", err)
+	}
+	return s3.New(sess), nil
+}
+
+// parseBoolParam reads a bool or string param from the map with a default.
+func parseBoolParam(params map[string]any, key string, def bool) bool {
+	v, ok := params[key]
+	if !ok {
+		return def
+	}
+	switch s := v.(type) {
+	case bool:
+		return s
+	case string:
+		b, err := strconv.ParseBool(s)
+		if err != nil {
+			return def
+		}
+		return b
+	}
+	return def
+}
+
+// validateNamespaceName enforces S3 bucket naming rules: 3–63 characters,
+// lowercase alphanumeric and hyphens only, no leading/trailing/consecutive hyphens.
+func validateNamespaceName(name string) error {
+	if len(name) < 3 || len(name) > 63 {
+		return fmt.Errorf("namespace name %q: must be 3–63 characters", name)
+	}
+	if name[0] == '-' || name[len(name)-1] == '-' {
+		return fmt.Errorf("namespace name %q: must not start or end with a hyphen", name)
+	}
+	if strings.Contains(name, "--") {
+		return fmt.Errorf("namespace name %q: must not contain consecutive hyphens", name)
+	}
+	for _, r := range name {
+		if !('a' <= r && r <= 'z' || '0' <= r && r <= '9' || r == '-') {
+			return fmt.Errorf("namespace name %q: must contain only lowercase letters, digits, and hyphens", name)
+		}
+	}
+	return nil
+}
+
+// isAlreadyOwnedByYou reports whether err is the AWS BucketAlreadyOwnedByYou error.
+func isAlreadyOwnedByYou(err error) bool {
+	if err == nil {
+		return false
+	}
+	if ae, ok := err.(awserr.Error); ok {
+		return ae.Code() == "BucketAlreadyOwnedByYou"
+	}
+	return false
+}
+
 // namespaceFromRef extracts the first path component of the repository name.
 // For "myns/repo" returns "myns". For a single-component name returns "".
 func namespaceFromRef(name reference.Named) string {
@@ -537,6 +708,17 @@ func (c *lruCache) getOrCreate(key string, create func() (distribution.Namespace
 	}
 	entry := v.(*cacheEntry)
 	return entry.reg, entry.driver, nil
+}
+
+// evict removes a single entry from the cache by key, if present.
+func (c *lruCache) evict(key string) {
+	c.mu.Lock()
+	if el, ok := c.byKey[key]; ok {
+		c.order.Remove(el)
+		delete(c.byKey, key)
+	}
+	c.mu.Unlock()
+	c.items.Delete(key)
 }
 
 // allNamespaces returns all cached distribution.Namespace instances.

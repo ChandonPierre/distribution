@@ -72,6 +72,14 @@ type policyConfig struct {
 	// filtering is applied; the caller sees every repository in the registry.
 	// Takes precedence over catalog_prefix and catalog_prefix_expression.
 	CatalogFullAccess bool `mapstructure:"catalog_full_access" yaml:"catalog_full_access"`
+
+	// NamespaceCreate, when true, grants namespace:*:create access to any token
+	// that satisfies the main policy expression. Enables PUT /management/namespaces/{name}.
+	NamespaceCreate bool `mapstructure:"namespace_create" yaml:"namespace_create"`
+
+	// NamespaceDelete, when true, grants namespace:*:delete access to any token
+	// that satisfies the main policy expression. Enables DELETE /management/namespaces/{name}.
+	NamespaceDelete bool `mapstructure:"namespace_delete" yaml:"namespace_delete"`
 }
 
 // accessController implements auth.AccessController for Kubernetes OIDC service account tokens.
@@ -399,12 +407,26 @@ func (ac *accessController) Authorized(req *http.Request, accessItems ...auth.Ac
 	// Each access item must be independently approved by at least one policy.
 	grantedResources := make([]auth.Resource, 0, len(accessItems))
 	for _, access := range accessItems {
-		requestMap := map[string]any{
-			"type":       access.Type,
-			"repository": access.Name,
-			"actions":    []string{access.Action},
+		var granted bool
+		var err error
+
+		if access.Type == "namespace" && access.Action == "create" {
+			// namespace:*:create is granted by policies with namespace_create: true
+			// whose main expression matches the token. access.Name is forwarded so
+			// expressions can validate the target namespace name.
+			granted = namespaceCreateGranted(ps.policies, tokenMap, access.Name)
+		} else if access.Type == "namespace" && access.Action == "delete" {
+			// namespace:*:delete is granted by policies with namespace_delete: true.
+			granted = namespaceDeleteGranted(ps.policies, tokenMap, access.Name)
+		} else {
+			requestMap := map[string]any{
+				"type":       access.Type,
+				"repository": access.Name,
+				"actions":    []string{access.Action},
+			}
+			granted, err = evaluatePolicies(ps.policies, tokenMap, requestMap)
 		}
-		granted, err := evaluatePolicies(ps.policies, tokenMap, requestMap)
+
 		if err != nil {
 			challenge.err = ErrInsufficientScope
 			return nil, challenge

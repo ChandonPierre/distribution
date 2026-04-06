@@ -392,6 +392,9 @@ func NewApp(ctx context.Context, config *configuration.Configuration) *App {
 		app.router.PathPrefix("/ui").Handler(uiHandler())
 	}
 
+	// Register management API routes (/management/namespaces/{name}).
+	app.setupManagementRoutes()
+
 	return app
 }
 
