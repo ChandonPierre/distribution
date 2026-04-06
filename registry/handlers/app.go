@@ -354,6 +354,16 @@ func NewApp(ctx context.Context, config *configuration.Configuration) *App {
 		app.accessController = accessController
 		dcontext.GetLogger(app).Debugf("configured %q access controller", authType)
 
+		// Inject the app's shared Redis client into any provider that supports it.
+		// This allows providers (e.g. coreweave) to share the primary Redis pool
+		// rather than opening a separate connection via their own redis_url config.
+		if app.redis != nil {
+			if ri, ok := accessController.(auth.RedisInjectable); ok {
+				ri.SetRedisClient(app.redis)
+				dcontext.GetLogger(app).Debugf("injected shared redis client into %q access controller", authType)
+			}
+		}
+
 		// If the access controller also provides a built-in token endpoint,
 		// register it at /auth/token so Docker clients can exchange credentials
 		// for a short-lived registry JWT without a separate token service.

@@ -91,6 +91,16 @@ func (c *chainAccessController) Authorized(r *http.Request, access ...auth.Acces
 	return nil, lastChallenge
 }
 
+// SetRedisClient implements auth.RedisInjectable by propagating the shared
+// Redis client to every inner provider that supports the interface.
+func (c *chainAccessController) SetRedisClient(client any) {
+	for _, p := range c.providers {
+		if ri, ok := p.(auth.RedisInjectable); ok {
+			ri.SetRedisClient(client)
+		}
+	}
+}
+
 // TokenHandler implements auth.TokenEndpointer by delegating to the first
 // inner provider that supports the interface. If no inner provider does,
 // a 501 handler is returned so that the /auth/token endpoint exists but

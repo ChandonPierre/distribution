@@ -130,6 +130,16 @@ type TokenEndpointer interface {
 	TokenHandler() http.Handler
 }
 
+// RedisInjectable may be implemented by an AccessController to receive the
+// application's shared Redis client after construction. The client argument
+// will be of type redis.UniversalClient (from github.com/redis/go-redis/v9).
+// This method is called at most once, before the server begins serving requests.
+// Providers that implement this interface use the injected client instead of
+// opening their own connection when the app already has Redis configured.
+type RedisInjectable interface {
+	SetRedisClient(client any)
+}
+
 // Register is used to register an InitFunc for
 // an AccessController backend with the given name.
 func Register(name string, initFunc InitFunc) error {

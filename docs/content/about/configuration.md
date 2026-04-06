@@ -649,9 +649,11 @@ The `auth` option is **optional**. Possible auth providers include:
 - [`token`](#token)
 - [`htpasswd`](#htpasswd)
 - [`kubeoidc`](#kubeoidc)
+- [`coreweave`](#coreweave)
+- [`chain`](#chain)
 - [`none`]
 
-You can configure only one authentication provider.
+Only one authentication provider is active at a time. Use [`chain`](#chain) to try multiple providers in order.
 
 ### `silly`
 
@@ -806,6 +808,107 @@ auth:
         expression: |
           token["sub"].startsWith("system:serviceaccount:") &&
           request["actions"] == ["pull"]
+```
+
+### `coreweave`
+
+The `coreweave` authentication provider validates bearer tokens by forwarding
+them to the CoreWeave WhoAmI API. The API returns a principal containing the
+user's identity, organisation, and group memberships. Access is then controlled
+by [CEL](https://cel.dev/) policy expressions evaluated against the returned
+principal.
+
+| Parameter                | Required | Description |
+|--------------------------|----------|-------------|
+| `realm`                  | yes      | The realm in which the registry authenticates. |
+| `service`                | no       | The service name included in Bearer challenge responses. |
+| `whoami_url`             | no       | URL of the WhoAmI API endpoint. Defaults to `https://api.coreweave.com/v1beta1/auth/whoami`. |
+| `whoami_timeout`         | no       | HTTP timeout for WhoAmI calls. Defaults to `10s`. |
+| `redis_url`              | no       | Redis connection URL (e.g. `redis://localhost:6379`). When set, WhoAmI responses are cached in Redis. When the application has a shared Redis instance configured, that pool is used automatically and `redis_url` is not required. |
+| `whoami_cache_ttl`       | no       | How long a WhoAmI response is served as a fresh cache hit before the API is called again. Defaults to `5m`. Requires `redis_url` or a shared Redis instance. |
+| `whoami_stale_ttl`       | no       | How long a WhoAmI response is retained as a stale fallback. When the WhoAmI endpoint is unreachable (network error or 5xx), the stale entry is served instead of failing the request. **Token rejections (401/403) are never served from stale cache.** Defaults to `1h`. Requires `redis_url` or a shared Redis instance. |
+| `policies`               | no       | List of inline CEL policy rules. |
+| `policy_file`            | no       | Path to an external YAML file containing the `policies` list. Polled every `policy_reload_interval`. If set, inline `policies` are ignored. |
+| `policy_reload_interval` | no       | How often to poll `policy_file` for changes. Defaults to `30s`. |
+
+Each entry in `policies` has the following fields:
+
+| Field                       | Description |
+|-----------------------------|-------------|
+| `name`                      | Human-readable name used in log messages. |
+| `expression`                | CEL boolean expression evaluated against the `principal` map. |
+| `catalog_prefix`            | Static prefix for `/v2/_catalog` filtering. |
+| `catalog_prefix_expression` | CEL expression that returns a string prefix (e.g. `principal["uid"]`). Takes precedence over `catalog_prefix`. |
+| `catalog_full_access`       | If `true`, a matching principal sees all repositories in `/v2/_catalog`. |
+| `namespace_create`          | If `true`, a matching principal may call `PUT /management/namespaces/{name}`. |
+| `namespace_delete`          | If `true`, a matching principal may call `DELETE /management/namespaces/{name}`. |
+
+CEL variables available in each expression:
+
+| Variable                        | Type           | Description |
+|---------------------------------|----------------|-------------|
+| `principal["uid"]`              | `string`       | User identifier from the WhoAmI response. |
+| `principal["org_uid"]`          | `string`       | Organisation identifier. |
+| `principal["groups"]`           | `list(string)` | Group memberships. |
+| `principal["console_actions"]`  | `list(string)` | Permitted console actions. |
+
+```yaml
+auth:
+  coreweave:
+    realm: https://registry.example.com
+    service: registry.example.com
+    whoami_url: https://api.coreweave.com/v1beta1/auth/whoami
+    whoami_timeout: 10s
+    redis_url: redis://localhost:6379
+    whoami_cache_ttl: 5m
+    whoami_stale_ttl: 1h
+    policies:
+      - name: org-members-pull
+        expression: 'principal["org_uid"] == "my-org"'
+        catalog_prefix_expression: 'principal["uid"]'
+      - name: org-admins-full
+        expression: '"registry-admins" in principal["groups"]'
+        catalog_full_access: true
+        namespace_create: true
+        namespace_delete: true
+```
+
+### `chain`
+
+The `chain` provider tries a list of authentication providers in order,
+returning the first successful grant. This allows you to accept multiple token
+types (for example, both Kubernetes SA tokens and CoreWeave API tokens) on the
+same registry instance.
+
+Behaviour:
+
+- Each provider is tried in declaration order.
+- If a provider returns a grant (success), evaluation stops immediately.
+- If a provider returns an `auth.Challenge` (token invalid for that provider), the next provider is tried.
+- If a provider returns any other error, evaluation stops and the error is returned immediately.
+- If all providers return challenges, the last challenge is returned to the client.
+- Nested `chain` providers are forbidden.
+- The token endpoint (`GET /auth/token`) is handled by the **first** provider in the list that exposes one. If no provider exposes a token endpoint, the registry returns `501 Not Implemented`.
+
+| Parameter   | Required | Description |
+|-------------|----------|-------------|
+| `providers` | yes      | Ordered list of provider configs. Each entry must have a `type` key (e.g. `kubeoidc`, `coreweave`, `htpasswd`) plus all options required by that provider type. |
+
+```yaml
+auth:
+  chain:
+    providers:
+      - type: kubeoidc
+        realm: https://registry.example.com/auth/token
+        service: registry.example.com
+        issuers:
+          - https://kubernetes.default.svc
+        policy_file: /etc/registry/kube-policy.yaml
+      - type: coreweave
+        realm: https://registry.example.com
+        service: registry.example.com
+        redis_url: redis://localhost:6379
+        policy_file: /etc/registry/cw-policy.yaml
 ```
 
 ## `middleware`
