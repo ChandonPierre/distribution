@@ -275,6 +275,7 @@ func newAccessController(options map[string]any) (auth.AccessController, error) 
 
 	ac.tokenEndpoint = &tokenEndpointHandler{
 		ac:          ac,
+		realm:       cfg.Realm,
 		service:     cfg.Service,
 		issuer:      tokenIssuer,
 		tokenExpiry: tokenExpiry,

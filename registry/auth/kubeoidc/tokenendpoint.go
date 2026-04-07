@@ -105,6 +105,7 @@ type signingKeyState struct {
 // Token Authentication specification.
 type tokenEndpointHandler struct {
 	ac          *accessController
+	realm       string // used in WWW-Authenticate Basic challenges
 	service     string
 	issuer      string // "iss" in issued tokens
 	tokenExpiry time.Duration
@@ -142,7 +143,7 @@ func (h *tokenEndpointHandler) ServeHTTP(w http.ResponseWriter, r *http.Request)
 		// Credentials supplied but password is empty (e.g. stale/expired imagepullsecret).
 		// Return 401 so the client re-authenticates rather than falling through to the
 		// anonymous path and receiving a zero-access token.
-		w.Header().Set("WWW-Authenticate", fmt.Sprintf("Basic realm=%q", service))
+		w.Header().Set("WWW-Authenticate", fmt.Sprintf("Basic realm=%q", h.realm))
 		http.Error(w, "basic auth required", http.StatusUnauthorized)
 		return
 	}
@@ -243,7 +244,7 @@ func (h *tokenEndpointHandler) ServeHTTP(w http.ResponseWriter, r *http.Request)
 	// fall back to retrying with their JWT rather than presenting a zero-access token to the
 	// registry and receiving "insufficient scope".
 	if anonymous && len(grantedAccess) == 0 {
-		w.Header().Set("WWW-Authenticate", fmt.Sprintf("Basic realm=%q", service))
+		w.Header().Set("WWW-Authenticate", fmt.Sprintf("Basic realm=%q", h.realm))
 		http.Error(w, "authorization required", http.StatusUnauthorized)
 		return
 	}
