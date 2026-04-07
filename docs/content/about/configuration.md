@@ -847,6 +847,9 @@ principal.
 | `policies`               | no       | List of inline CEL policy rules. |
 | `policy_file`            | no       | Path to an external YAML file containing the `policies` list. Polled every `policy_reload_interval`. If set, inline `policies` are ignored. |
 | `policy_reload_interval` | no       | How often to poll `policy_file` for changes. Defaults to `30s`. |
+| `signing_key`            | no       | Path to a PEM-encoded ECDSA P-256 private key used to sign registry-issued tokens. If omitted, an ephemeral key is generated at startup (tokens are invalidated on restart and cannot be shared across replicas). Hot-reloaded on file change. |
+| `token_expiry`           | no       | Lifetime of registry-issued tokens. Defaults to `5m`. |
+| `token_issuer`           | no       | `iss` claim in registry-issued tokens. Defaults to `service`. Must not conflict with any trusted external issuer. |
 
 Each entry in `policies` has the following fields:
 
@@ -882,6 +885,8 @@ auth:
     redis_url: redis://localhost:6379
     whoami_cache_ttl: 5m
     whoami_stale_ttl: 1h
+    signing_key: /etc/registry/token-signing.pem  # optional; ephemeral if omitted
+    token_expiry: 5m
     policies:
       - name: org-members-pull
         expression: 'principal["org_uid"] == "my-org"'

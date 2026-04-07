@@ -38,6 +38,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/go-jose/go-jose/v4"
+	josejwt "github.com/go-jose/go-jose/v4/jwt"
 	"github.com/mitchellh/mapstructure"
 	"github.com/redis/go-redis/v9"
 	"github.com/sirupsen/logrus"
@@ -90,6 +92,17 @@ type config struct {
 	PolicyFile           string         `mapstructure:"policy_file"`
 	PolicyReloadInterval string         `mapstructure:"policy_reload_interval"`
 	Policies             []policyConfig `mapstructure:"policies"`
+
+	// Token endpoint configuration.
+	// SigningKey is an optional path to a PEM-encoded ECDSA P-256 private key.
+	// If omitted, an ephemeral key is generated at startup (tokens are
+	// invalidated on restart and cannot be shared across replicas).
+	SigningKey string `mapstructure:"signing_key"`
+	// TokenExpiry is the lifetime of registry-issued tokens (default "5m").
+	TokenExpiry string `mapstructure:"token_expiry"`
+	// TokenIssuer is the "iss" claim in registry-issued tokens.
+	// Defaults to the value of Service.
+	TokenIssuer string `mapstructure:"token_issuer"`
 }
 
 // principal holds the fields from a CoreWeave WhoAmI response that are
@@ -167,6 +180,13 @@ type accessController struct {
 	cacheTTL   time.Duration
 	staleTTL   time.Duration
 	policySet  atomic.Pointer[policySet]
+
+	// tokenEndpoint is non-nil when the built-in token exchange endpoint is active.
+	tokenEndpoint *tokenEndpointHandler
+	// signingKey holds the current key pair used to sign and verify registry-issued tokens.
+	signingKey atomic.Pointer[signingKeyState]
+	// tokenIssuer is the expected "iss" value for registry-issued tokens.
+	tokenIssuer string
 }
 
 // Errors returned as auth challenges.
@@ -284,6 +304,20 @@ func newAccessController(options map[string]any) (auth.AccessController, error) 
 		return nil, fmt.Errorf("coreweave: compiling policies: %w", err)
 	}
 
+	tokenExpiry := 5 * time.Minute
+	if cfg.TokenExpiry != "" {
+		d, err := time.ParseDuration(cfg.TokenExpiry)
+		if err != nil {
+			return nil, fmt.Errorf("coreweave: invalid token_expiry: %w", err)
+		}
+		tokenExpiry = d
+	}
+
+	tokenIssuer := cfg.TokenIssuer
+	if tokenIssuer == "" {
+		tokenIssuer = cfg.Service
+	}
+
 	var cache principalCacher
 	if cfg.RedisURL != "" {
 		opt, err := redis.ParseURL(cfg.RedisURL)
@@ -293,24 +327,51 @@ func newAccessController(options map[string]any) (auth.AccessController, error) 
 		cache = &redisCache{pool: redis.NewClient(opt)}
 	}
 
-	ac := &accessController{
-		realm:     cfg.Realm,
-		service:   cfg.Service,
-		whoAmIURL: whoAmIURL,
-		httpClient: &http.Client{
-			Timeout: whoAmITimeout,
-		},
-		cache:    cache,
-		cacheTTL: cacheTTL,
-		staleTTL: staleTTL,
+	initialKey, keyID, err := loadOrGenerateSigningKey(cfg.SigningKey)
+	if err != nil {
+		return nil, fmt.Errorf("coreweave: signing key: %w", err)
 	}
+
+	ac := &accessController{
+		realm:       cfg.Realm,
+		service:     cfg.Service,
+		whoAmIURL:   whoAmIURL,
+		httpClient:  &http.Client{Timeout: whoAmITimeout},
+		cache:       cache,
+		cacheTTL:    cacheTTL,
+		staleTTL:    staleTTL,
+		tokenIssuer: tokenIssuer,
+	}
+	ac.signingKey.Store(&signingKeyState{
+		privateKey: initialKey,
+		publicKey:  &initialKey.PublicKey,
+		keyID:      keyID,
+	})
 	ac.policySet.Store(&policySet{policies: compiled})
 
 	if cfg.PolicyFile != "" {
 		startPolicyReloader(cfg.PolicyFile, reloadInterval, &ac.policySet, celEnv)
 	}
+	if cfg.SigningKey != "" {
+		startSigningKeyReloader(cfg.SigningKey, reloadInterval, &ac.signingKey)
+	}
+
+	ac.tokenEndpoint = &tokenEndpointHandler{
+		ac:          ac,
+		realm:       cfg.Realm,
+		service:     cfg.Service,
+		issuer:      tokenIssuer,
+		tokenExpiry: tokenExpiry,
+		signingKey:  &ac.signingKey,
+	}
 
 	return ac, nil
+}
+
+// TokenHandler returns the built-in token endpoint HTTP handler.
+// It implements auth.TokenEndpointer so the registry can register it automatically.
+func (ac *accessController) TokenHandler() http.Handler {
+	return ac.tokenEndpoint
 }
 
 // SetRedisClient implements auth.RedisInjectable. When the application has a
@@ -332,6 +393,8 @@ func (ac *accessController) SetRedisClient(client any) {
 
 // Authorized calls the CoreWeave WhoAmI API (with Redis caching) and evaluates
 // CEL policies against the returned principal.
+// Registry-issued JWTs (from the built-in token endpoint) are verified locally
+// against the signing key and bypass the WhoAmI call entirely.
 func (ac *accessController) Authorized(r *http.Request, accessItems ...auth.Access) (*auth.Grant, error) {
 	challenge := authChallenge{
 		realm:   ac.realm,
@@ -347,7 +410,19 @@ func (ac *accessController) Authorized(r *http.Request, accessItems ...auth.Acce
 	}
 	rawToken = strings.TrimSpace(rawToken)
 
-	// Resolve the principal (cache → WhoAmI API).
+	// Fast path: registry-issued JWT (from our own token endpoint).
+	// These are JWTs with iss == tokenIssuer, signed with our signing key.
+	// Verify locally to avoid an unnecessary WhoAmI call.
+	if ac.tokenIssuer != "" {
+		if parsed, parseErr := josejwt.ParseSigned(rawToken, []jose.SignatureAlgorithm{jose.ES256}); parseErr == nil {
+			var unverified josejwt.Claims
+			if err := parsed.UnsafeClaimsWithoutVerification(&unverified); err == nil && unverified.Issuer == ac.tokenIssuer {
+				return ac.authorizeRegistryToken(parsed, accessItems, challenge)
+			}
+		}
+	}
+
+	// Resolve the principal via the WhoAmI API (cache → live call).
 	p, err := ac.resolvePrincipal(r.Context(), rawToken)
 	if err != nil {
 		logrus.Warnf("coreweave: whoami failed: %v", err)
@@ -395,6 +470,52 @@ func (ac *accessController) Authorized(r *http.Request, accessItems ...auth.Acce
 		User:            auth.UserInfo{Name: p.Uid},
 		Resources:       grantedResources,
 		CatalogPrefixes: catalogPrefixes,
+	}, nil
+}
+
+// authorizeRegistryToken validates a registry-issued JWT (from the built-in token
+// endpoint) and checks that its embedded access claims cover the requested items.
+func (ac *accessController) authorizeRegistryToken(
+	parsedToken *josejwt.JSONWebToken,
+	accessItems []auth.Access,
+	challenge authChallenge,
+) (*auth.Grant, error) {
+	var claims registryClaims
+	if err := parsedToken.Claims(ac.signingKey.Load().publicKey, &claims); err != nil {
+		challenge.err = errWhoAmIFailed
+		return nil, challenge
+	}
+
+	expected := josejwt.Expected{
+		Issuer:      ac.tokenIssuer,
+		AnyAudience: josejwt.Audience{ac.service},
+	}
+	if err := claims.ValidateWithLeeway(expected, 60*time.Second); err != nil {
+		challenge.err = errWhoAmIFailed
+		return nil, challenge
+	}
+
+	type accessKey struct{ typ, name, action string }
+	granted := make(map[accessKey]struct{})
+	for _, ra := range claims.Access {
+		for _, action := range ra.Actions {
+			granted[accessKey{ra.Type, ra.Name, action}] = struct{}{}
+		}
+	}
+
+	grantedResources := make([]auth.Resource, 0, len(accessItems))
+	for _, item := range accessItems {
+		if _, ok := granted[accessKey{item.Type, item.Name, item.Action}]; !ok {
+			challenge.err = errInsufficientScope
+			return nil, challenge
+		}
+		grantedResources = append(grantedResources, item.Resource)
+	}
+
+	return &auth.Grant{
+		User:            auth.UserInfo{Name: claims.Subject},
+		Resources:       grantedResources,
+		CatalogPrefixes: claims.CatalogPrefixes,
 	}, nil
 }
 
