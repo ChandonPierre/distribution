@@ -125,8 +125,12 @@ func (h *tokenEndpointHandler) ServeHTTP(w http.ResponseWriter, r *http.Request)
 	if service == "" {
 		service = h.service
 	}
-	// scope may be repeated: e.g. scope=repository:foo:pull&scope=repository:bar:push
-	scopes := q["scope"]
+	// scope may be repeated (scope=a&scope=b) or space-separated within one
+	// parameter (scope=a+b). Split on spaces to normalise both forms.
+	var scopes []string
+	for _, s := range q["scope"] {
+		scopes = append(scopes, strings.Fields(s)...)
+	}
 
 	// --- Extract credentials ---
 	// Docker sends Basic auth where username = docker login username and

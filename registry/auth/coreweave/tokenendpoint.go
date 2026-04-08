@@ -155,7 +155,12 @@ func (h *tokenEndpointHandler) ServeHTTP(w http.ResponseWriter, r *http.Request)
 	if service == "" {
 		service = h.service
 	}
-	scopes := q["scope"]
+	// scope may be repeated (scope=a&scope=b) or space-separated within one
+	// parameter (scope=a+b). Split on spaces to normalise both forms.
+	var scopes []string
+	for _, s := range q["scope"] {
+		scopes = append(scopes, strings.Fields(s)...)
+	}
 
 	// Docker sends Basic auth where the password is the CoreWeave bearer token.
 	// An anonymous request (no Authorization header) is allowed so that policies

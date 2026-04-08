@@ -130,17 +130,63 @@ func (c *chainAccessController) SetRedisClient(client any) {
 	}
 }
 
-// TokenHandler implements auth.TokenEndpointer by delegating to the first
-// inner provider that supports the interface. If no inner provider does,
-// a 501 handler is returned so that the /auth/token endpoint exists but
-// clearly communicates that no token issuer is configured in the chain.
+// TokenHandler implements auth.TokenEndpointer by trying each inner provider
+// that supports the interface in order. A provider that returns 401 causes the
+// next provider to be tried; any other status (including 200) is final. This
+// allows the chain to serve both kubeoidc SA-JWT credentials and CoreWeave
+// opaque tokens from a single /auth/token endpoint.
+// If no inner provider is configured, a 501 handler is returned.
 func (c *chainAccessController) TokenHandler() http.Handler {
+	var handlers []http.Handler
 	for _, p := range c.providers {
 		if te, ok := p.(auth.TokenEndpointer); ok {
-			return te.TokenHandler()
+			handlers = append(handlers, te.TokenHandler())
 		}
 	}
+	if len(handlers) == 0 {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			http.Error(w, "no token endpoint configured in chain", http.StatusNotImplemented)
+		})
+	}
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		http.Error(w, "no token endpoint configured in chain", http.StatusNotImplemented)
+		for i, h := range handlers {
+			rec := &bufferedResponseWriter{header: make(http.Header)}
+			h.ServeHTTP(rec, r)
+			if rec.code != http.StatusUnauthorized || i == len(handlers)-1 {
+				// Success, or last provider — write whatever we got.
+				for k, vs := range rec.header {
+					for _, v := range vs {
+						w.Header().Add(k, v)
+					}
+				}
+				w.WriteHeader(rec.code)
+				_, _ = w.Write(rec.buf)
+				return
+			}
+			// 401 from this provider — try the next one.
+		}
 	})
+}
+
+// bufferedResponseWriter captures an http.Handler's response so the chain can
+// inspect the status code before deciding whether to forward it or try the
+// next provider.
+type bufferedResponseWriter struct {
+	header http.Header
+	code   int
+	buf    []byte
+}
+
+func (b *bufferedResponseWriter) Header() http.Header { return b.header }
+func (b *bufferedResponseWriter) WriteHeader(code int) {
+	if b.code == 0 {
+		b.code = code
+	}
+}
+func (b *bufferedResponseWriter) Write(p []byte) (int, error) {
+	if b.code == 0 {
+		b.code = http.StatusOK
+	}
+	b.buf = append(b.buf, p...)
+	return len(p), nil
 }
