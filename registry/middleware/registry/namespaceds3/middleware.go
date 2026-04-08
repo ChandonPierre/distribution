@@ -169,6 +169,8 @@ func newNamespacedS3Registry(
 	delete(s3Params, "redirect")
 	delete(s3Params, "redirectheader")
 	delete(s3Params, "presignendpoint")
+	deleteEnabled := parseBoolParam(options, "deleteenabled", false)
+	delete(s3Params, "deleteenabled")
 
 	// Enable the storage redirect path when either the default is true or a
 	// per-request header override is configured. The conditionalRedirectDriver
@@ -176,6 +178,9 @@ func newNamespacedS3Registry(
 	registryOpts := registrymiddleware.GetRegistryOptions()
 	if redirectDefault || redirectHeader != "" {
 		registryOpts = append(registryOpts, storage.EnableRedirect)
+	}
+	if deleteEnabled {
+		registryOpts = append(registryOpts, storage.EnableDelete)
 	}
 
 	nsReg := &namespacedS3Registry{
