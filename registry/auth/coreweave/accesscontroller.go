@@ -33,7 +33,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -208,8 +210,18 @@ var _ auth.Challenge = authChallenge{}
 
 func (c authChallenge) Error() string { return c.err.Error() }
 
-func (c authChallenge) SetHeaders(_ *http.Request, w http.ResponseWriter) {
-	str := fmt.Sprintf("Bearer realm=%q,service=%q", c.realm, c.service)
+func (c authChallenge) SetHeaders(r *http.Request, w http.ResponseWriter) {
+	realm := c.realm
+	if r != nil {
+		if ns := subdomainNamespace(r.Host, c.realm); ns != "" {
+			sep := "?"
+			if strings.Contains(realm, "?") {
+				sep = "&"
+			}
+			realm += sep + "namespace=" + url.QueryEscape(ns)
+		}
+	}
+	str := fmt.Sprintf("Bearer realm=%q,service=%q", realm, c.service)
 	if c.scope != "" {
 		str += fmt.Sprintf(",scope=%q", c.scope)
 	}
@@ -220,6 +232,38 @@ func (c authChallenge) SetHeaders(_ *http.Request, w http.ResponseWriter) {
 		str += `,error="insufficient_scope"`
 	}
 	w.Header().Add("WWW-Authenticate", str)
+}
+
+// subdomainNamespace returns the subdomain label of reqHost if it is a
+// single-label direct subdomain of the realm's host, otherwise "".
+// E.g. reqHost="foo.example.com",
+//
+//	realm="https://foo.example.com/auth/token"
+//
+// returns "foo".
+func subdomainNamespace(reqHost, realm string) string {
+	u, err := url.Parse(realm)
+	if err != nil || u.Host == "" {
+		return ""
+	}
+	realmHost, _, _ := net.SplitHostPort(u.Host)
+	if realmHost == "" {
+		realmHost = u.Host
+	}
+	reqHostname, _, _ := net.SplitHostPort(reqHost)
+	if reqHostname == "" {
+		reqHostname = reqHost
+	}
+	suffix := "." + strings.ToLower(realmHost)
+	lower := strings.ToLower(reqHostname)
+	if !strings.HasSuffix(lower, suffix) {
+		return ""
+	}
+	ns := reqHostname[:len(reqHostname)-len(suffix)]
+	if strings.Contains(ns, ".") {
+		return "" // not a direct subdomain
+	}
+	return ns
 }
 
 func scopeString(accessItems []auth.Access) string {

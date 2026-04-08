@@ -3,7 +3,9 @@ package kubeoidc
 import (
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -37,7 +39,7 @@ type config struct {
 	// SigningKey is an optional path to a PEM-encoded ECDSA private key used
 	// to sign registry-issued tokens. If omitted, an ephemeral key is generated
 	// at startup (tokens are invalidated on restart).
-	SigningKey  string `mapstructure:"signing_key"`
+	SigningKey string `mapstructure:"signing_key"`
 	// TokenExpiry is the lifetime of registry-issued tokens (default "5m").
 	TokenExpiry string `mapstructure:"token_expiry"`
 	// TokenIssuer is the "iss" claim value in registry-issued tokens.
@@ -124,8 +126,18 @@ func (c authChallenge) Status() int {
 	return http.StatusUnauthorized
 }
 
-func (c authChallenge) SetHeaders(_ *http.Request, w http.ResponseWriter) {
-	str := fmt.Sprintf("Bearer realm=%q,service=%q", c.realm, c.service)
+func (c authChallenge) SetHeaders(r *http.Request, w http.ResponseWriter) {
+	realm := c.realm
+	if r != nil {
+		if ns := subdomainNamespace(r.Host, c.realm); ns != "" {
+			sep := "?"
+			if strings.Contains(realm, "?") {
+				sep = "&"
+			}
+			realm += sep + "namespace=" + url.QueryEscape(ns)
+		}
+	}
+	str := fmt.Sprintf("Bearer realm=%q,service=%q", realm, c.service)
 	if c.scope != "" {
 		str = fmt.Sprintf("%s,scope=%q", str, c.scope)
 	}
@@ -136,6 +148,38 @@ func (c authChallenge) SetHeaders(_ *http.Request, w http.ResponseWriter) {
 		str = fmt.Sprintf("%s,error=%q", str, "insufficient_scope")
 	}
 	w.Header().Add("WWW-Authenticate", str)
+}
+
+// subdomainNamespace returns the subdomain label of reqHost if it is a
+// single-label direct subdomain of the realm's host, otherwise "".
+// E.g. reqHost="foo.example.com",
+//
+//	realm="https://foo.example.com/auth/token"
+//
+// returns "foo".
+func subdomainNamespace(reqHost, realm string) string {
+	u, err := url.Parse(realm)
+	if err != nil || u.Host == "" {
+		return ""
+	}
+	realmHost, _, _ := net.SplitHostPort(u.Host)
+	if realmHost == "" {
+		realmHost = u.Host
+	}
+	reqHostname, _, _ := net.SplitHostPort(reqHost)
+	if reqHostname == "" {
+		reqHostname = reqHost
+	}
+	suffix := "." + strings.ToLower(realmHost)
+	lower := strings.ToLower(reqHostname)
+	if !strings.HasSuffix(lower, suffix) {
+		return ""
+	}
+	ns := reqHostname[:len(reqHostname)-len(suffix)]
+	if strings.Contains(ns, ".") {
+		return "" // not a direct subdomain
+	}
+	return ns
 }
 
 // scopeString serializes access items into "type:name:action type:name:action" format.

@@ -155,6 +155,9 @@ func (h *tokenEndpointHandler) ServeHTTP(w http.ResponseWriter, r *http.Request)
 	if service == "" {
 		service = h.service
 	}
+	// namespace is an optional hint injected by the registry into the realm URL
+	// when subdomain namespacing is enabled (see authChallenge.SetHeaders).
+	namespace := q.Get("namespace")
 	// scope may be repeated (scope=a&scope=b) or space-separated within one
 	// parameter (scope=a+b). Split on spaces to normalise both forms.
 	var scopes []string
@@ -194,6 +197,7 @@ func (h *tokenEndpointHandler) ServeHTTP(w http.ResponseWriter, r *http.Request)
 
 	var grantedAccess []resourceActions
 	for _, scope := range scopes {
+		scope = qualifyScope(scope, namespace)
 		if scope == "registry:catalog:*" {
 			if !anonymous || len(catalogPrefixesForPrincipal(ps, principalMap)) > 0 {
 				grantedAccess = append(grantedAccess, resourceActions{
@@ -274,6 +278,24 @@ func (h *tokenEndpointHandler) ServeHTTP(w http.ResponseWriter, r *http.Request)
 	if err := json.NewEncoder(w).Encode(resp); err != nil {
 		logrus.Warnf("coreweave/token: writing response: %v", err)
 	}
+}
+
+// qualifyScope prepends namespace to the repository component of a scope string
+// when the repository name contains no "/" (i.e. is missing its namespace prefix).
+// It is a no-op when namespace is empty or the scope is already qualified.
+// E.g. "repository:image:pull" + "foo" → "repository:foo/image:pull"
+func qualifyScope(scope, namespace string) string {
+	if namespace == "" {
+		return scope
+	}
+	parts := strings.SplitN(scope, ":", 3)
+	if len(parts) != 3 {
+		return scope
+	}
+	if parts[0] == "repository" && !strings.Contains(parts[1], "/") {
+		return "repository:" + namespace + "/" + parts[1] + ":" + parts[2]
+	}
+	return scope
 }
 
 // evaluateScopeForPrincipal parses a scope string and evaluates CEL policies

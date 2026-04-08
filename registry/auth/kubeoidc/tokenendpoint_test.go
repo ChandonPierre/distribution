@@ -551,3 +551,49 @@ func TestLoadOrGenerateSigningKey(t *testing.T) {
 		}
 	})
 }
+
+func TestQualifyScope(t *testing.T) {
+	cases := []struct {
+		scope     string
+		namespace string
+		want      string
+	}{
+		// No namespace — pass through unchanged.
+		{"repository:image:pull", "", "repository:image:pull"},
+		// Already qualified — no double-prefix.
+		{"repository:foo/image:pull", "foo", "repository:foo/image:pull"},
+		// Unqualified repository — prepend namespace.
+		{"repository:image:pull", "foo", "repository:foo/image:pull"},
+		{"repository:image:pull,push", "ns", "repository:ns/image:pull,push"},
+		// Non-repository scopes are untouched.
+		{"registry:catalog:*", "ns", "registry:catalog:*"},
+		// Malformed scope — pass through unchanged.
+		{"badscope", "ns", "badscope"},
+	}
+	for _, tc := range cases {
+		got := qualifyScope(tc.scope, tc.namespace)
+		if got != tc.want {
+			t.Errorf("qualifyScope(%q, %q) = %q; want %q", tc.scope, tc.namespace, got, tc.want)
+		}
+	}
+}
+
+func TestSubdomainNamespace(t *testing.T) {
+	realm := "https://example.com/auth/token"
+	cases := []struct {
+		reqHost string
+		want    string
+	}{
+		{"foo.example.com", "foo"},
+		{"example.com", ""},            // base domain — no subdomain
+		{"other.example.com", ""},      // unrelated domain
+		{"a.b.example.com", ""},        // multi-level subdomain
+		{"foo.example.com:443", "foo"}, // with port
+	}
+	for _, tc := range cases {
+		got := subdomainNamespace(tc.reqHost, realm)
+		if got != tc.want {
+			t.Errorf("subdomainNamespace(%q, realm) = %q; want %q", tc.reqHost, got, tc.want)
+		}
+	}
+}
