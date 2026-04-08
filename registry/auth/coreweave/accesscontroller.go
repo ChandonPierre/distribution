@@ -212,13 +212,23 @@ func (c authChallenge) Error() string { return c.err.Error() }
 
 func (c authChallenge) SetHeaders(r *http.Request, w http.ResponseWriter) {
 	realm := c.realm
-	if r != nil {
-		if ns := subdomainNamespace(r.Host, c.realm); ns != "" {
-			sep := "?"
-			if strings.Contains(realm, "?") {
-				sep = "&"
+	if r != nil && subdomainNamespace(r.Host, c.realm) != "" {
+		// Replace the realm host with the request's subdomain host so that
+		// browser token requests are same-origin, avoiding CORS preflight
+		// failures. The token endpoint derives the namespace from its own
+		// r.Host. E.g. realm "https://registry.example.com/auth/token"
+		// becomes "https://foo.registry.example.com/auth/token".
+		if u, err := url.Parse(c.realm); err == nil {
+			reqHost, port, _ := net.SplitHostPort(r.Host)
+			if reqHost == "" {
+				reqHost = r.Host
 			}
-			realm += sep + "namespace=" + url.QueryEscape(ns)
+			if port != "" {
+				u.Host = reqHost + ":" + port
+			} else {
+				u.Host = reqHost
+			}
+			realm = u.String()
 		}
 	}
 	str := fmt.Sprintf("Bearer realm=%q,service=%q", realm, c.service)

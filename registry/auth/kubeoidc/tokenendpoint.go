@@ -125,13 +125,14 @@ func (h *tokenEndpointHandler) ServeHTTP(w http.ResponseWriter, r *http.Request)
 	if service == "" {
 		service = h.service
 	}
-	// namespace is an optional hint injected by the registry into the realm URL
-	// when subdomain namespacing is enabled. It allows the token endpoint to
-	// qualify unscoped repository names before policy evaluation, eliminating
+	// When subdomain namespacing is enabled the auth challenge repoints the
+	// realm to the subdomain host (e.g. foo.registry.example.com/auth/token).
+	// Derive the namespace from this request's own Host header so that
+	// unqualified scopes can be prefixed before policy evaluation, eliminating
 	// the extra auth round-trip caused by clients guessing the wrong scope.
-	// E.g. namespace="foo", scope="repository:image:pull"
+	// E.g. Host "foo.registry.example.com" + scope "repository:image:pull"
 	//   → evaluated as "repository:foo/image:pull"
-	namespace := q.Get("namespace")
+	namespace := subdomainNamespace(r.Host, h.realm)
 	// scope may be repeated (scope=a&scope=b) or space-separated within one
 	// parameter (scope=a+b). Split on spaces to normalise both forms.
 	var scopes []string

@@ -155,9 +155,10 @@ func (h *tokenEndpointHandler) ServeHTTP(w http.ResponseWriter, r *http.Request)
 	if service == "" {
 		service = h.service
 	}
-	// namespace is an optional hint injected by the registry into the realm URL
-	// when subdomain namespacing is enabled (see authChallenge.SetHeaders).
-	namespace := q.Get("namespace")
+	// When subdomain namespacing is enabled the auth challenge repoints the
+	// realm to the subdomain host (e.g. foo.registry.example.com/auth/token).
+	// Derive the namespace from this request's own Host header.
+	namespace := subdomainNamespace(r.Host, h.realm)
 	// scope may be repeated (scope=a&scope=b) or space-separated within one
 	// parameter (scope=a+b). Split on spaces to normalise both forms.
 	var scopes []string

@@ -585,15 +585,55 @@ func TestSubdomainNamespace(t *testing.T) {
 		want    string
 	}{
 		{"foo.example.com", "foo"},
-		{"example.com", ""},            // base domain — no subdomain
-		{"other.example.com", ""},      // unrelated domain
-		{"a.b.example.com", ""},        // multi-level subdomain
-		{"foo.example.com:443", "foo"}, // with port
+		{"example.com", ""},               // base domain — no subdomain
+		{"foo.unrelated.com", ""},         // different domain entirely
+		{"a.b.example.com", ""},           // multi-level subdomain — not a direct subdomain
+		{"foo.example.com:443", "foo"},    // with port
 	}
 	for _, tc := range cases {
 		got := subdomainNamespace(tc.reqHost, realm)
 		if got != tc.want {
 			t.Errorf("subdomainNamespace(%q, realm) = %q; want %q", tc.reqHost, got, tc.want)
 		}
+	}
+}
+
+func TestSetHeadersRealmSubdomain(t *testing.T) {
+	ch := authChallenge{
+		err:     ErrTokenRequired,
+		realm:   "https://registry.example.com/auth/token",
+		service: "registry.example.com",
+	}
+
+	// Request arriving on the subdomain — realm host should be rewritten.
+	req := httptest.NewRequest(http.MethodGet, "/v2/", nil)
+	req.Host = "foo.registry.example.com"
+	rw := httptest.NewRecorder()
+	ch.SetHeaders(req, rw)
+	got := rw.Result().Header.Get("WWW-Authenticate")
+	wantRealm := `realm="https://foo.registry.example.com/auth/token"`
+	if !strings.Contains(got, wantRealm) {
+		t.Errorf("subdomain request: expected realm rewrite in WWW-Authenticate\n  got:  %s\n  want substring: %s", got, wantRealm)
+	}
+
+	// Request arriving on the base domain — realm should be unchanged.
+	req2 := httptest.NewRequest(http.MethodGet, "/v2/", nil)
+	req2.Host = "registry.example.com"
+	rw2 := httptest.NewRecorder()
+	ch.SetHeaders(req2, rw2)
+	got2 := rw2.Result().Header.Get("WWW-Authenticate")
+	wantRealm2 := `realm="https://registry.example.com/auth/token"`
+	if !strings.Contains(got2, wantRealm2) {
+		t.Errorf("base domain request: expected unchanged realm\n  got:  %s\n  want substring: %s", got2, wantRealm2)
+	}
+
+	// Deep subdomain — should not be rewritten (only direct subdomains are scoped).
+	req3 := httptest.NewRequest(http.MethodGet, "/v2/", nil)
+	req3.Host = "a.b.registry.example.com"
+	rw3 := httptest.NewRecorder()
+	ch.SetHeaders(req3, rw3)
+	got3 := rw3.Result().Header.Get("WWW-Authenticate")
+	if !strings.Contains(got3, wantRealm2) {
+		t.Errorf("deep subdomain: expected unchanged realm\n  got:  %s\n  want substring: %s", got3, wantRealm2)
 	}
 }
