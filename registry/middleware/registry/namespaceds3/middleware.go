@@ -637,10 +637,15 @@ func isAlreadyOwnedByYou(err error) bool {
 
 // namespaceFromRef extracts the first path component of the repository name.
 // For "myns/repo" returns "myns". For a single-component name returns "".
+//
+// name.Name() is used instead of reference.Path() because the reference
+// library parses single-label names (e.g. "cwf420-public") as the domain
+// component, causing Path() to return only the trailing component ("ubuntu")
+// and losing the namespace prefix entirely.
 func namespaceFromRef(name reference.Named) string {
-	path := reference.Path(name)
-	if i := strings.IndexByte(path, '/'); i > 0 {
-		return path[:i]
+	n := name.Name()
+	if i := strings.IndexByte(n, '/'); i > 0 {
+		return n[:i]
 	}
 	return ""
 }
