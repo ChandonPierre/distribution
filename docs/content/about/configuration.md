@@ -1109,7 +1109,7 @@ repository names have a namespace prefix (e.g. `myns/myapp`).
   explicitly. In most deployments these two blocks contain the same values.
 
 The `bucket` key must not appear in the middleware options; it is always derived
-from the namespace name. All other routing options (`redirectheader`,
+from the namespace name. All other routing options (`redirect`, `redirectheader`,
 `endpointheader`, `presignendpoint`, etc.) are also scoped to the middleware
 config and have no relationship to the base storage driver settings.
 
@@ -1215,13 +1215,13 @@ middleware:
             accesskey: eu-access-key
             secretkey: eu-secret-key
 
-        # Redirect vs proxy: if X-Direct-To-S3 is present, send 307 to presigned URL.
-        # Omit this option to always proxy through the registry.
+        # Redirect vs proxy: redirect: true sends all requests to S3 via presigned URL.
+        # redirectheader overrides this per-request when present (its bool value wins).
+        redirect: true
         redirectheader: X-Direct-To-S3
 
-        # Presigned URL endpoint (optional): when redirectheader triggers a redirect
-        # and no endpointheader is present, use this endpoint to generate the
-        # presigned URL instead of the normal S3 endpoint.
+        # Presigned URL endpoint (optional): when redirect is in effect and no
+        # endpointheader is present, use this endpoint to generate the presigned URL.
         presignendpoint:
           regionendpoint: https://public-s3.example.com
           # accesskey/secretkey can also be overridden here for a separate IAM role
@@ -1231,8 +1231,9 @@ middleware:
 |-----------|----------|-------------|
 | `endpointheader` | no | The HTTP request header whose value selects the named endpoint block (e.g. `X-Storage-Region`). If absent or empty, the base S3 params are used. |
 | `endpoints` | no | A map of named endpoint override blocks. Each key is a header value; the value is a map of S3 parameters that override the base params for that endpoint. The `bucket` key is forbidden inside an endpoint block — it is always set to the namespace name. |
-| `redirectheader` | no | If set, the named HTTP request header controls whether blobs are served via redirect or proxy. When the header is **present** on a GET/HEAD request the client receives an HTTP 307 redirect to a presigned S3 URL and downloads directly from S3. When the header is **absent** the registry proxies the bytes. Omit this option (the default) to always proxy. |
-| `presignendpoint` | no | S3 parameter overrides used exclusively for presigned URL generation. When set and `redirectheader` is configured, requests on the default (no `endpointheader`) path generate presigned URLs from a second S3 driver pointed at this endpoint. Useful when the internal S3 endpoint used for proxying is not reachable by external clients. Any S3 parameter accepted by the base config is valid here (`regionendpoint`, `accesskey`, `secretkey`, etc.). When a named endpoint is selected via `endpointheader`, that endpoint is used for both normal traffic and presigned URLs — `presignendpoint` is not applied. |
+| `redirect` | no | Default redirect behaviour. `true` = serve blobs via HTTP 307 redirect to a presigned S3 URL (client downloads directly from S3). `false` (default) = proxy bytes through the registry. Can be overridden per-request by `redirectheader`. |
+| `redirectheader` | no | Optional HTTP request header name. When present on a request, its value is parsed as a boolean and overrides `redirect` for that request only. Setting this without `redirect: true` allows clients to opt in to redirect on a per-request basis. |
+| `presignendpoint` | no | S3 parameter overrides used exclusively for presigned URL generation. When redirect is in effect (via `redirect: true` or the `redirectheader` value) and no named endpoint is selected, presigned URLs are generated from a second S3 driver pointed at this endpoint. Useful when the internal S3 endpoint used for proxying is not reachable by external clients. Any S3 parameter accepted by the base config is valid here (`regionendpoint`, `accesskey`, `secretkey`, etc.). When a named endpoint is selected via `endpointheader`, that endpoint is used for both normal traffic and presigned URLs — `presignendpoint` is not applied. |
 
 When the header is absent or its value does not match any configured endpoint
 key, the request falls back to the base S3 parameters. Each unique

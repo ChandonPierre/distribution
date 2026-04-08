@@ -54,9 +54,16 @@ func init() {
 // registries, each backed by an S3 driver whose bucket equals the namespace name.
 // Optionally, a request header selects a named S3 endpoint config, allowing
 // different endpoints (and credentials) per request while keeping bucket=namespace.
-// A separate redirectheader option enables per-request redirect vs proxy selection.
+//
+// Redirect vs proxy behaviour is controlled by two independent options:
+//   - redirect (bool): the base default. When true, S3 redirect (presigned URL)
+//     is used for all requests unless overridden by the header. Default: false (proxy).
+//   - redirectheader (string): optional header name. When present on a request,
+//     its value is parsed as a boolean and overrides redirect for that request only.
+//
 // When presignendpoint is configured, presigned URL generation uses a second S3
-// driver built from those overrides instead of the normal endpoint.
+// driver built from those overrides. This applies whenever redirect is in effect
+// (via redirect:true or the header), regardless of which mechanism triggered it.
 type namespacedS3Registry struct {
 	distribution.Namespace // fallback for non-namespace / single-component names
 
@@ -64,8 +71,9 @@ type namespacedS3Registry struct {
 	registryOpts    []storage.RegistryOption
 	endpointHeader  string                    // request header name for endpoint selection, e.g. "X-Storage-Region"
 	endpoints       map[string]map[string]any // named endpoint param overrides keyed by header value
-	redirectHeader  string                    // if set, presence of this header on a request triggers S3 redirect
-	presignEndpoint map[string]any            // param overrides applied to the presigned-URL driver (default path only)
+	redirectDefault bool                      // base redirect setting; true = redirect, false = proxy
+	redirectHeader  string                    // optional header whose bool value overrides redirectDefault per-request
+	presignEndpoint map[string]any            // param overrides applied to the presigned-URL driver
 
 	cache *lruCache
 }
@@ -123,7 +131,10 @@ func newNamespacedS3Registry(
 		}
 	}
 
-	// Parse redirect-vs-proxy header config.
+	// Parse redirect-vs-proxy config.
+	// redirect (bool): base default — true = redirect, false = proxy.
+	// redirectheader (string): optional header; its bool value overrides redirect per-request.
+	redirectDefault := parseBoolParam(options, "redirect", false)
 	redirectHeader, _ := options["redirectheader"].(string)
 
 	// Parse presign endpoint overrides. When set, presigned URL generation uses
@@ -155,14 +166,15 @@ func newNamespacedS3Registry(
 	delete(s3Params, "purgeenabled")
 	delete(s3Params, "endpointheader")
 	delete(s3Params, "endpoints")
+	delete(s3Params, "redirect")
 	delete(s3Params, "redirectheader")
 	delete(s3Params, "presignendpoint")
 
-	// If redirect-header routing is configured, enable the redirect path on all
-	// per-namespace registries. The conditionalRedirectDriver wrapper then gates
-	// actual presigned-URL generation on the presence of the header per request.
+	// Enable the storage redirect path when either the default is true or a
+	// per-request header override is configured. The conditionalRedirectDriver
+	// wrapper then applies the correct per-request decision at serve time.
 	registryOpts := registrymiddleware.GetRegistryOptions()
-	if redirectHeader != "" {
+	if redirectDefault || redirectHeader != "" {
 		registryOpts = append(registryOpts, storage.EnableRedirect)
 	}
 
@@ -172,6 +184,7 @@ func newNamespacedS3Registry(
 		registryOpts:    registryOpts,
 		endpointHeader:  endpointHeader,
 		endpoints:       endpoints,
+		redirectDefault: redirectDefault,
 		redirectHeader:  redirectHeader,
 		presignEndpoint: presignEndpoint,
 		cache:           newLRUCache(maxSize),
@@ -361,8 +374,12 @@ func (r *namespacedS3Registry) getOrCreate(ctx context.Context, ns string) (dist
 		}
 
 		var drv storagedriver.StorageDriver = d
-		if r.redirectHeader != "" {
-			crd := &conditionalRedirectDriver{StorageDriver: d, header: r.redirectHeader}
+		if r.redirectDefault || r.redirectHeader != "" {
+			crd := &conditionalRedirectDriver{
+				StorageDriver:   d,
+				defaultRedirect: r.redirectDefault,
+				header:          r.redirectHeader,
+			}
 			// When presignendpoint is configured and no named endpoint is in play,
 			// build a second S3 driver pointed at the presign endpoint so that
 			// RedirectURL uses different credentials/endpoint from normal traffic.
@@ -656,25 +673,39 @@ func (s *contextualBlobStatter) Stat(ctx context.Context, dgst digest.Digest) (d
 
 // --- Conditional redirect driver ---
 
-// conditionalRedirectDriver wraps a StorageDriver and gates redirect on the
-// presence of a request header. If the header is present (non-empty), RedirectURL
-// is called on presignDriver (when configured) or the embedded StorageDriver,
-// potentially returning a presigned S3 URL that triggers an HTTP 307 redirect.
-// If the header is absent, "" is returned and the blobserver proxies bytes
-// through the registry. All other StorageDriver methods are promoted unchanged.
+// conditionalRedirectDriver wraps a StorageDriver and determines per-request
+// whether to redirect (presigned URL) or proxy.
+//
+// Decision logic:
+//  1. If header is set and the request carries that header, parse its value as
+//     a bool. That value overrides defaultRedirect for this request.
+//  2. Otherwise, use defaultRedirect.
+//
+// When redirect is in effect, RedirectURL is delegated to presignDriver (when
+// configured) or the embedded StorageDriver. When proxy is in effect, "" is
+// returned so the blobserver proxies bytes through the registry.
 //
 // presignDriver is non-nil when presignendpoint is configured and the default
 // (no endpointheader) path is in use. It points at a different S3 endpoint
 // and/or credentials optimised for generating public-facing presigned URLs.
 type conditionalRedirectDriver struct {
-	storagedriver.StorageDriver         // handles all normal storage operations
-	presignDriver storagedriver.StorageDriver // used only for RedirectURL; nil = use embedded driver
-	header        string
+	storagedriver.StorageDriver               // handles all normal storage operations
+	presignDriver   storagedriver.StorageDriver // used only for RedirectURL; nil = use embedded driver
+	defaultRedirect bool
+	header          string
 }
 
 func (d *conditionalRedirectDriver) RedirectURL(r *http.Request, path string) (string, error) {
-	if r.Header.Get(d.header) == "" {
-		return "", nil // header absent → proxy
+	redirect := d.defaultRedirect
+	if d.header != "" {
+		if val := r.Header.Get(d.header); val != "" {
+			if b, err := strconv.ParseBool(val); err == nil {
+				redirect = b
+			}
+		}
+	}
+	if !redirect {
+		return "", nil // proxy
 	}
 	if d.presignDriver != nil {
 		return d.presignDriver.RedirectURL(r, path)
