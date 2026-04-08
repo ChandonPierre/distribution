@@ -114,13 +114,13 @@ func newNamespacedS3Registry(
 	endpointHeader, _ := options["endpointheader"].(string)
 	var endpoints map[string]map[string]any
 	if v, ok := options["endpoints"]; ok {
-		raw, ok := v.(map[string]any)
+		raw, ok := toStringMap(v)
 		if !ok {
 			return nil, fmt.Errorf("namespaceds3: endpoints must be a map")
 		}
 		endpoints = make(map[string]map[string]any, len(raw))
 		for k, val := range raw {
-			block, ok := val.(map[string]any)
+			block, ok := toStringMap(val)
 			if !ok {
 				return nil, fmt.Errorf("namespaceds3: endpoint %q must be a map", k)
 			}
@@ -142,7 +142,7 @@ func newNamespacedS3Registry(
 	// params. Only applies on the default (no endpointheader) request path.
 	var presignEndpoint map[string]any
 	if v, ok := options["presignendpoint"]; ok {
-		raw, ok := v.(map[string]any)
+		raw, ok := toStringMap(v)
 		if !ok {
 			return nil, fmt.Errorf("namespaceds3: presignendpoint must be a map")
 		}
@@ -557,6 +557,27 @@ func buildS3Client(params map[string]any) (*s3.S3, error) {
 		return nil, fmt.Errorf("buildS3Client: new session: %w", err)
 	}
 	return s3.New(sess), nil
+}
+
+// toStringMap converts a value to map[string]any, handling both the native
+// map[string]any form and the map[interface{}]interface{} form that go-yaml v2
+// produces when unmarshalling nested maps into map[string]any fields.
+func toStringMap(v any) (map[string]any, bool) {
+	switch m := v.(type) {
+	case map[string]any:
+		return m, true
+	case map[interface{}]interface{}:
+		out := make(map[string]any, len(m))
+		for k, val := range m {
+			ks, ok := k.(string)
+			if !ok {
+				return nil, false
+			}
+			out[ks] = val
+		}
+		return out, true
+	}
+	return nil, false
 }
 
 // parseBoolParam reads a bool or string param from the map with a default.

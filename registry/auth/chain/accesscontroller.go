@@ -36,14 +36,14 @@ type chainAccessController struct {
 }
 
 func newChainAccessController(options map[string]any) (auth.AccessController, error) {
-	rawProviders, ok := options["providers"].([]any)
+	rawProviders, ok := normalizeValue(options["providers"]).([]any)
 	if !ok || len(rawProviders) == 0 {
 		return nil, fmt.Errorf("chain auth: 'providers' must be a non-empty list")
 	}
 
 	controllers := make([]auth.AccessController, 0, len(rawProviders))
 	for i, rp := range rawProviders {
-		pm, ok := rp.(map[string]any)
+		pm, ok := normalizeValue(rp).(map[string]any)
 		if !ok {
 			return nil, fmt.Errorf("chain auth: providers[%d] must be a map", i)
 		}
@@ -57,7 +57,7 @@ func newChainAccessController(options map[string]any) (auth.AccessController, er
 		params := make(map[string]any, len(pm))
 		for k, v := range pm {
 			if k != "type" {
-				params[k] = v
+				params[k] = normalizeValue(v)
 			}
 		}
 		ac, err := auth.GetAccessController(typ, params)
@@ -89,6 +89,35 @@ func (c *chainAccessController) Authorized(r *http.Request, access ...auth.Acces
 		return nil, err
 	}
 	return nil, lastChallenge
+}
+
+// normalizeValue recursively converts map[interface{}]interface{} and
+// []interface{} values produced by go-yaml v2 into map[string]any and []any
+// so that downstream code can use standard type assertions.
+func normalizeValue(v any) any {
+	switch val := v.(type) {
+	case map[interface{}]interface{}:
+		out := make(map[string]any, len(val))
+		for k, elem := range val {
+			if ks, ok := k.(string); ok {
+				out[ks] = normalizeValue(elem)
+			}
+		}
+		return out
+	case map[string]any:
+		out := make(map[string]any, len(val))
+		for k, elem := range val {
+			out[k] = normalizeValue(elem)
+		}
+		return out
+	case []any:
+		out := make([]any, len(val))
+		for i, elem := range val {
+			out[i] = normalizeValue(elem)
+		}
+		return out
+	}
+	return v
 }
 
 // SetRedisClient implements auth.RedisInjectable by propagating the shared
