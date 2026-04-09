@@ -332,7 +332,7 @@ func TestOrgIDStoredFromJWKSHeader(t *testing.T) {
 }
 
 func TestOrgIDEmptyWhenHeaderAbsent(t *testing.T) {
-	srv, _, issuer := setupMockOIDCServer(t) // does NOT set X-Org-Id
+	srv, _, issuer := setupMockOIDCServer(t) // does NOT set X-Org-Id on either endpoint
 	_ = srv
 
 	client := &http.Client{Timeout: 5 * time.Second}
@@ -342,6 +342,49 @@ func TestOrgIDEmptyWhenHeaderAbsent(t *testing.T) {
 	}
 	if got := cache.getOrgID(); got != "" {
 		t.Errorf("getOrgID() = %q, want empty string", got)
+	}
+}
+
+// TestOrgIDFromDiscoveryWhenJWKSLacksHeader verifies that X-Org-Id returned on
+// the OIDC discovery document is used when the JWKS endpoint omits the header.
+func TestOrgIDFromDiscoveryWhenJWKSLacksHeader(t *testing.T) {
+	key, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	jwk := jose.JSONWebKey{Key: key.Public(), KeyID: "kid", Algorithm: "ES256", Use: "sig"}
+	jwksBytes, _ := json.Marshal(jose.JSONWebKeySet{Keys: []jose.JSONWebKey{jwk}})
+
+	const wantOrgID = "cwf420"
+	var serverURL string
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/.well-known/openid-configuration", func(w http.ResponseWriter, r *http.Request) {
+		// X-Org-Id on the discovery document; absent from the JWKS endpoint below.
+		w.Header().Set("X-Org-Id", wantOrgID)
+		_ = json.NewEncoder(w).Encode(oidcDiscoveryDocument{Issuer: serverURL, JWKSURI: serverURL + "/keys"})
+	})
+	mux.HandleFunc("/keys", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		// Deliberately no X-Org-Id header here.
+		_, _ = w.Write(jwksBytes)
+	})
+	srv := httptest.NewServer(mux)
+	serverURL = srv.URL
+	t.Cleanup(srv.Close)
+
+	client := &http.Client{Timeout: 5 * time.Second}
+	cache, err := newJWKSCache(serverURL, time.Hour, client)
+	if err != nil {
+		t.Fatalf("newJWKSCache: %v", err)
+	}
+	if got := cache.getOrgID(); got != wantOrgID {
+		t.Errorf("getOrgID() = %q, want %q (seeded from discovery)", got, wantOrgID)
+	}
+
+	// Subsequent JWKS refreshes must not clear the value.
+	if err := cache.syncRefresh(); err != nil {
+		t.Fatalf("syncRefresh: %v", err)
+	}
+	if got := cache.getOrgID(); got != wantOrgID {
+		t.Errorf("after refresh getOrgID() = %q, want %q (must not be cleared)", got, wantOrgID)
 	}
 }
 

@@ -144,6 +144,10 @@ func newJWKSCache(issuer string, refresh time.Duration, client *http.Client) (*j
 		refreshEvery: refresh,
 		httpClient:   client,
 		jwksURI:      doc.JWKSURI,
+		// Seed orgID from the discovery response. Some OIDC providers may return
+		// X-Org-Id on the discovery document but not on the JWKS endpoint.
+		// fetchAndStore will overwrite this if the JWKS endpoint also carries it.
+		orgID: resp.Header.Get("X-Org-Id"),
 	}
 	if err := c.fetchAndStore(); err != nil {
 		return nil, err
@@ -174,7 +178,11 @@ func (c *jwksCache) fetchAndStore() error {
 
 	c.mu.Lock()
 	c.keys = &keySet
-	c.orgID = resp.Header.Get("X-Org-Id")
+	// Only update orgID when the JWKS endpoint provides the header; if absent,
+	// preserve the value seeded from the discovery document on initial load.
+	if id := resp.Header.Get("X-Org-Id"); id != "" {
+		c.orgID = id
+	}
 	c.fetchedAt = time.Now()
 	c.mu.Unlock()
 	return nil

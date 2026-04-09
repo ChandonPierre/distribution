@@ -220,6 +220,13 @@ func (h *tokenEndpointHandler) ServeHTTP(w http.ResponseWriter, r *http.Request)
 		if raw, ok := tokenMap["aud"]; ok {
 			tokenMap["aud"] = toStringSlice(raw)
 		}
+		// Inject the org_id synthetic claim from the JWKS cache, mirroring
+		// what Authorized() does. Without this, CEL policies using
+		// token["org_id"] silently fail at the token endpoint with
+		// "no such key: org_id" and issue a zero-access token.
+		if orgID := cache.getOrgID(); orgID != "" {
+			tokenMap["org_id"] = orgID
+		}
 	}
 
 	ps := h.ac.policySet.Load()
