@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"strings"
 
+	"github.com/distribution/distribution/v3/internal/dcontext"
 	"github.com/distribution/distribution/v3/registry/auth"
 	registrymiddleware "github.com/distribution/distribution/v3/registry/middleware/registry"
 )
@@ -100,6 +101,7 @@ func (h *namespaceHandler) handleCreate(w http.ResponseWriter, r *http.Request, 
 		}
 		return
 	}
+	dcontext.GetLoggerWithField(r.Context(), "namespace", h.name).Info("management: namespace created")
 	w.WriteHeader(http.StatusCreated)
 }
 
@@ -118,5 +120,6 @@ func (h *namespaceHandler) handleDelete(w http.ResponseWriter, r *http.Request, 
 		}
 		return
 	}
+	dcontext.GetLoggerWithField(r.Context(), "namespace", h.name).Info("management: namespace deleted")
 	w.WriteHeader(http.StatusNoContent)
 }

@@ -11,8 +11,10 @@ import (
 	"strings"
 	"time"
 
+	"github.com/distribution/distribution/v3/internal/dcontext"
 	"github.com/distribution/distribution/v3/registry/auth"
 	"github.com/redis/go-redis/v9"
+	"github.com/sirupsen/logrus"
 )
 
 var _ auth.AccessController = (*cachingAccessController)(nil)
@@ -59,8 +61,10 @@ func (c *cachingAccessController) Authorized(r *http.Request, accessItems ...aut
 
 	// Hot path: try the cache first.
 	if grant, ok := c.loadGrant(r.Context(), cacheKey); ok {
+		dcontext.GetLogger(r.Context()).Debug("auth_cache: hit")
 		return grant, nil
 	}
+	dcontext.GetLogger(r.Context()).Debug("auth_cache: miss")
 
 	// Cold path: call inner controller.
 	grant, err := c.inner.Authorized(r, accessItems...)
@@ -96,8 +100,9 @@ func (c *cachingAccessController) storeGrant(ctx context.Context, key string, gr
 	if err != nil {
 		return
 	}
-	// Ignore Redis write errors — they only affect caching, not correctness.
-	_ = c.pool.Set(ctx, key, raw, ttl).Err()
+	if err := c.pool.Set(ctx, key, raw, ttl).Err(); err != nil {
+		logrus.WithError(err).Warn("auth_cache: redis write failed")
+	}
 }
 
 // authGrantCacheKey produces a collision-resistant cache key from the raw

@@ -280,6 +280,30 @@ func (h *tokenEndpointHandler) ServeHTTP(w http.ResponseWriter, r *http.Request)
 	if sub == "" {
 		sub = username
 	}
+
+	// Log every token issuance so operators have an audit trail of who got what.
+	{
+		fields := logrus.Fields{
+			"sub":       sub,
+			"namespace": namespace,
+			"anonymous": anonymous,
+		}
+		if tokenMap != nil {
+			if iss, ok := tokenMap["iss"].(string); ok {
+				fields["issuer"] = iss
+			}
+			if orgID, ok := tokenMap["org_id"].(string); ok && orgID != "" {
+				fields["org_id"] = orgID
+			}
+		}
+		var grantedScopes []string
+		for _, ra := range grantedAccess {
+			grantedScopes = append(grantedScopes, ra.Type+":"+ra.Name+":"+strings.Join(ra.Actions, ","))
+		}
+		fields["scopes"] = grantedScopes
+		logrus.WithFields(fields).Info("kubeoidc/token: access granted")
+	}
+
 	claims := registryClaims{
 		Claims: josejwt.Claims{
 			Issuer:    h.issuer,

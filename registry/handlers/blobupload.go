@@ -251,6 +251,10 @@ func (buh *blobUploadHandler) PutBlobUploadComplete(w http.ResponseWriter, r *ht
 		buh.Errors = append(buh.Errors, errcode.ErrorCodeUnknown.WithDetail(err))
 		return
 	}
+	dcontext.GetLoggerWithFields(buh, map[any]any{
+		"blob.digest": desc.Digest.String(),
+		"blob.size":   desc.Size,
+	}).Info("blob upload complete")
 }
 
 // CancelBlobUpload cancels an in-progress upload of a blob.

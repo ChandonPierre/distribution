@@ -23,6 +23,7 @@ import (
 	"net/http"
 
 	"github.com/distribution/distribution/v3/registry/auth"
+	"github.com/sirupsen/logrus"
 )
 
 func init() {
@@ -76,12 +77,14 @@ func newChainAccessController(options map[string]any) (auth.AccessController, er
 // all providers challenge, the last challenge is returned.
 func (c *chainAccessController) Authorized(r *http.Request, access ...auth.Access) (*auth.Grant, error) {
 	var lastChallenge auth.Challenge
-	for _, p := range c.providers {
+	for i, p := range c.providers {
 		grant, err := p.Authorized(r, access...)
 		if err == nil {
+			logrus.WithField("provider_index", i).Debug("chain: provider authorized request")
 			return grant, nil
 		}
 		if ch, ok := err.(auth.Challenge); ok {
+			logrus.WithField("provider_index", i).Debug("chain: provider challenged, trying next")
 			lastChallenge = ch
 			continue
 		}
@@ -154,6 +157,10 @@ func (c *chainAccessController) TokenHandler() http.Handler {
 			h.ServeHTTP(rec, r)
 			if rec.code != http.StatusUnauthorized || i == len(handlers)-1 {
 				// Success, or last provider — write whatever we got.
+				logrus.WithFields(logrus.Fields{
+					"provider_index": i,
+					"status":         rec.code,
+				}).Debug("chain/token: provider handled request")
 				for k, vs := range rec.header {
 					for _, v := range vs {
 						w.Header().Add(k, v)
@@ -164,6 +171,7 @@ func (c *chainAccessController) TokenHandler() http.Handler {
 				return
 			}
 			// 401 from this provider — try the next one.
+			logrus.WithField("provider_index", i).Debug("chain/token: provider returned 401, trying next")
 		}
 	})
 }

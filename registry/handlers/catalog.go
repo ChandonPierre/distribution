@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/distribution/distribution/v3/internal/dcontext"
 	"github.com/distribution/distribution/v3/registry/api/errcode"
 	"github.com/distribution/distribution/v3/registry/storage/driver"
 	"github.com/gorilla/handlers"
@@ -81,6 +82,10 @@ func (ch *catalogHandler) GetCatalog(w http.ResponseWriter, r *http.Request) {
 	// Serve from the catalog cache when available.
 	if ch.App.appCache != nil && catalogCacheKey != "" {
 		if cached, _ := ch.App.appCache.GetCatalog(ch.Context, catalogCacheKey); cached != nil {
+			dcontext.GetLoggerWithFields(ch.Context, map[any]any{
+				"catalog_cache":  "hit",
+				"repos_returned": len(cached),
+			}).Debug("catalog: served from cache")
 			w.Header().Set("Content-Type", "application/json")
 			enc := json.NewEncoder(w)
 			if err := enc.Encode(catalogAPIResponse{Repositories: cached}); err != nil {
@@ -205,6 +210,18 @@ func (ch *catalogHandler) GetCatalog(w http.ResponseWriter, r *http.Request) {
 	if ch.App.appCache != nil && catalogCacheKey != "" && !moreEntries {
 		_ = ch.App.appCache.SetCatalog(ch.Context, catalogCacheKey, repos[:filled])
 	}
+
+	logFields := map[any]any{
+		"repos_returned": filled,
+		"more_entries":   moreEntries,
+	}
+	if catalogCacheKey != "" {
+		logFields["catalog_cache"] = "miss"
+	}
+	if pfxs := getCatalogPrefixes(ch.Context); pfxs != nil {
+		logFields["prefix_filter_count"] = len(pfxs)
+	}
+	dcontext.GetLoggerWithFields(ch.Context, logFields).Debug("catalog: response")
 
 	w.Header().Set("Content-Type", "application/json")
 

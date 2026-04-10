@@ -233,6 +233,27 @@ func (h *tokenEndpointHandler) ServeHTTP(w http.ResponseWriter, r *http.Request)
 			sub = uid
 		}
 	}
+
+	// Log every token issuance so operators have an audit trail of who got what.
+	{
+		fields := logrus.Fields{
+			"sub":       sub,
+			"namespace": namespace,
+			"anonymous": anonymous,
+		}
+		if principalMap != nil {
+			if orgUID, ok := principalMap["org_uid"].(string); ok && orgUID != "" {
+				fields["org_uid"] = orgUID
+			}
+		}
+		var grantedScopes []string
+		for _, ra := range grantedAccess {
+			grantedScopes = append(grantedScopes, ra.Type+":"+ra.Name+":"+strings.Join(ra.Actions, ","))
+		}
+		fields["scopes"] = grantedScopes
+		logrus.WithFields(fields).Info("coreweave/token: access granted")
+	}
+
 	claims := registryClaims{
 		Claims: josejwt.Claims{
 			Issuer:    h.issuer,
