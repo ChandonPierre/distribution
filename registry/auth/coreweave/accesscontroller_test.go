@@ -42,6 +42,13 @@ func (m *memCache) store(_ context.Context, key string, p *principal, ttl time.D
 	m.items[key] = memCacheItem{p: p, expiresAt: time.Now().Add(ttl)}
 }
 
+func (m *memCache) delete(_ context.Context, key string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	delete(m.items, key)
+	return nil
+}
+
 // seedStale pre-populates the stale cache key for a given raw token.
 func (m *memCache) seedStale(rawToken string, p *principal, ttl time.Duration) {
 	m.store(context.Background(), whoAmIStaleKeyPrefix+hashToken(rawToken), p, ttl)

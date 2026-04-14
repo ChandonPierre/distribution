@@ -40,6 +40,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	"golang.org/x/sync/singleflight"
+
 	"github.com/go-jose/go-jose/v4"
 	josejwt "github.com/go-jose/go-jose/v4/jwt"
 	"github.com/mitchellh/mapstructure"
@@ -147,6 +149,7 @@ func (p *principal) toMap() map[string]any {
 type principalCacher interface {
 	load(ctx context.Context, key string) (*principal, bool)
 	store(ctx context.Context, key string, p *principal, ttl time.Duration)
+	delete(ctx context.Context, key string) error
 }
 
 // redisCache implements principalCacher using a Redis connection pool.
@@ -172,6 +175,10 @@ func (rc *redisCache) store(ctx context.Context, key string, p *principal, ttl t
 	_ = rc.pool.Set(ctx, key, raw, ttl).Err()
 }
 
+func (rc *redisCache) delete(ctx context.Context, key string) error {
+	return rc.pool.Del(ctx, key).Err()
+}
+
 // accessController implements auth.AccessController for CoreWeave tokens.
 type accessController struct {
 	realm      string
@@ -181,6 +188,7 @@ type accessController struct {
 	cache      principalCacher // nil when Redis is not configured
 	cacheTTL   time.Duration
 	staleTTL   time.Duration
+	sfGroup    singleflight.Group // deduplicates concurrent WhoAmI calls for the same token
 	policySet  atomic.Pointer[policySet]
 
 	// tokenEndpoint is non-nil when the built-in token exchange endpoint is active.
@@ -591,11 +599,31 @@ func (ac *accessController) resolvePrincipal(ctx context.Context, rawToken strin
 		}
 	}
 
-	// Phase 2: call the WhoAmI API.
-	p, err := ac.callWhoAmI(ctx, rawToken)
+	// Phase 2: call the WhoAmI API, deduplicated across concurrent requests for
+	// the same token to avoid a stampede when the fresh cache entry expires.
+	v, err, _ := ac.sfGroup.Do(tokenHash, func() (any, error) {
+		return ac.callWhoAmI(ctx, rawToken)
+	})
+	var p *principal
+	if err == nil {
+		p = v.(*principal)
+	}
 	if err != nil {
+		if errors.Is(err, errTokenRejected) {
+			// Explicit rejection (401/403): evict both cache tiers so the revoked
+			// token cannot be served from stale during a future WhoAmI outage.
+			if ac.cache != nil {
+				if delErr := ac.cache.delete(ctx, whoAmIFreshKeyPrefix+tokenHash); delErr != nil {
+					logrus.Warnf("coreweave: failed to evict fresh cache entry for rejected token: %v", delErr)
+				}
+				if delErr := ac.cache.delete(ctx, whoAmIStaleKeyPrefix+tokenHash); delErr != nil {
+					logrus.Warnf("coreweave: failed to evict stale cache entry for rejected token: %v", delErr)
+				}
+			}
+			return nil, err
+		}
 		// Phase 3: serve stale on transient errors only.
-		if !errors.Is(err, errTokenRejected) && ac.cache != nil {
+		if ac.cache != nil {
 			if stale, ok := ac.cache.load(ctx, whoAmIStaleKeyPrefix+tokenHash); ok {
 				logrus.Warnf("coreweave: whoami unreachable, serving stale principal: %v", err)
 				return stale, nil
