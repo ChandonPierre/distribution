@@ -42,10 +42,12 @@ func (m *memCache) store(_ context.Context, key string, p *principal, ttl time.D
 	m.items[key] = memCacheItem{p: p, expiresAt: time.Now().Add(ttl)}
 }
 
-func (m *memCache) delete(_ context.Context, key string) error {
+func (m *memCache) delete(_ context.Context, keys ...string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	delete(m.items, key)
+	for _, key := range keys {
+		delete(m.items, key)
+	}
 	return nil
 }
 
@@ -398,6 +400,42 @@ func TestStaleCacheNotServedOnTokenRejected(t *testing.T) {
 	}
 	if _, ok := err.(auth.Challenge); !ok {
 		t.Fatalf("expected auth.Challenge, got %T: %v", err, err)
+	}
+}
+
+// TestStaleCacheNotServedOnHTTPError verifies that HTTP error responses (4xx/5xx
+// other than 401/403) do not trigger the stale cache fallback. The server is
+// reachable and returned a definitive answer, so stale data must not be served.
+func TestStaleCacheNotServedOnHTTPError(t *testing.T) {
+	stale := &principal{Uid: "alice", OrgUid: "acme", Groups: []string{"devs"}}
+
+	for _, code := range []int{http.StatusBadRequest, http.StatusNotFound, http.StatusInternalServerError, http.StatusServiceUnavailable} {
+		t.Run(http.StatusText(code), func(t *testing.T) {
+			srv := newWhoAmIServer(t, code, nil)
+			defer srv.Close()
+
+			cache := newMemCache()
+			cache.seedStale("tok", stale, time.Hour)
+
+			ac := &accessController{
+				realm:      "r",
+				service:    "s",
+				whoAmIURL:  srv.URL,
+				httpClient: srv.Client(),
+				cache:      cache,
+				cacheTTL:   5 * time.Minute,
+				staleTTL:   time.Hour,
+			}
+			ac.policySet.Store(&policySet{policies: nil})
+
+			_, err := ac.Authorized(bearerRequest(t, "tok"))
+			if err == nil {
+				t.Fatalf("status %d: expected challenge, got nil", code)
+			}
+			if _, ok := err.(auth.Challenge); !ok {
+				t.Fatalf("status %d: expected auth.Challenge, got %T: %v", code, err, err)
+			}
+		})
 	}
 }
 
