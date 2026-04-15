@@ -1322,6 +1322,7 @@ registry.
 | `relativeurls`| no    | If `true`,  the registry returns relative URLs in Location headers. The client is responsible for resolving the correct URL. **This option is not compatible with Docker 1.7 and earlier.**|
 | `draintimeout`| no    | Amount of time to wait for HTTP connections to drain before shutting down after registry receives SIGTERM signal|
 | `subdomainnamespacing` | no | If `true`, enables subdomain-based namespacing. See [`subdomainnamespacing`](#subdomainnamespacing). |
+| `enforcesubdomainnamespacing` | no | If `true`, rejects path-style namespaced requests with HTTP 421. Requires `subdomainnamespacing`. See [`subdomainnamespacing`](#subdomainnamespacing). |
 
 
 ### `subdomainnamespacing`
@@ -1361,9 +1362,30 @@ When used together with the `namespaceds3` registry middleware, each namespace
 subdomain is automatically routed to its own S3 bucket (bucket name equals the
 namespace name). See [`namespaceds3`](#namespaceds3) for details.
 
+**Enforcing subdomain-only access:**
+
+By default, clients can bypass subdomain routing by including the namespace in
+the URL path (e.g. `registry.example.com/myns/repo`). This can lead to
+incorrect S3 bucket routing and inconsistent catalog results because
+`Repositories()` and `BlobStatter()` rely on the subdomain context rather than
+the path. To prevent this, set `enforcesubdomainnamespacing: true`:
+
+```yaml
+http:
+  host: https://registry.example.com
+  subdomainnamespacing: true
+  enforcesubdomainnamespacing: true
+```
+
+Any request whose repository name contains a `/` but was not received via a
+namespace subdomain is rejected with **HTTP 421 Misdirected Request** and a
+warning log entry. Clients must use the subdomain form
+(`myns.registry.example.com/repo`) instead.
+
 | Parameter | Required | Description |
 |-----------|----------|-------------|
 | `subdomainnamespacing` | no | If `true`, the first subdomain label of the `Host` header is used as the repository namespace prefix. Defaults to `false`. |
+| `enforcesubdomainnamespacing` | no | If `true`, rejects requests where the namespace prefix was supplied via the URL path rather than the subdomain (HTTP 421). Requires `subdomainnamespacing: true`. Defaults to `false`. |
 
 ### `tls`
 

@@ -163,6 +163,14 @@ type HTTP struct {
 	// "myns.registry.example.com/v2/repo/..." is treated as "myns/repo".
 	SubdomainNamespacing bool `yaml:"subdomainnamespacing,omitempty"`
 
+	// EnforceSubdomainNamespacing, when true, rejects any request whose
+	// repository name contains a namespace prefix that was supplied via the
+	// URL path rather than the subdomain. Requires SubdomainNamespacing.
+	// Use this to prevent clients from bypassing subdomain routing by
+	// sending "registry.example.com/myns/repo/..." instead of
+	// "myns.registry.example.com/repo/...".
+	EnforceSubdomainNamespacing bool `yaml:"enforcesubdomainnamespacing,omitempty"`
+
 	// Prefix specifies a URL path prefix for the HTTP interface.
 	// This can be used to serve the registry under a specific path
 	// rather than at the root of the domain (e.g., "/registry").

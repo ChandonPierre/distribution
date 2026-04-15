@@ -756,6 +756,20 @@ func (app *App) dispatcher(dispatch dispatchFunc) http.Handler {
 
 		context := app.context(w, r)
 
+		// If subdomain namespacing is enforced, reject requests where the
+		// namespace was supplied in the URL path instead of the subdomain.
+		// A path-style namespaced request has a slash in vars.name but no
+		// subdomain.namespace in context (the subdomain middleware never ran).
+		if app.Config.HTTP.EnforceSubdomainNamespacing {
+			name := dcontext.GetStringValue(context, "vars.name")
+			ns := dcontext.GetStringValue(context, "subdomain.namespace")
+			if strings.Contains(name, "/") && ns == "" {
+				dcontext.GetLogger(context).Warnf("path-style namespace rejected (enforcesubdomainnamespacing): %s", name)
+				w.WriteHeader(http.StatusMisdirectedRequest)
+				return
+			}
+		}
+
 		defer func() {
 			// Automated error response handling here. Handlers may return their
 			// own errors if they need different behavior (such as range errors
