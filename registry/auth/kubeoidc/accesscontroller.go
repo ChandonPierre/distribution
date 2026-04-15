@@ -1,6 +1,7 @@
 package kubeoidc
 
 import (
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"net"
@@ -353,9 +354,32 @@ func (ac *accessController) Authorized(req *http.Request, accessItems ...auth.Ac
 		scope:   scopeString(accessItems),
 	}
 
-	// Extract bearer token.
+	// Extract the token. Accept both Bearer and Basic auth:
+	//   Bearer <JWT>  — standard Docker token auth flow
+	//   Basic <b64>   — username:password where the password is the SA JWT;
+	//                   used by tools (e.g. zb) that only support Basic auth
 	prefix, rawToken, ok := strings.Cut(req.Header.Get("Authorization"), " ")
-	if !ok || rawToken == "" || !strings.EqualFold(prefix, "bearer") {
+	if !ok || rawToken == "" {
+		challenge.err = ErrTokenRequired
+		return nil, challenge
+	}
+	switch {
+	case strings.EqualFold(prefix, "bearer"):
+		// rawToken is already the JWT — nothing to do.
+	case strings.EqualFold(prefix, "basic"):
+		decoded, err := base64.StdEncoding.DecodeString(rawToken)
+		if err != nil {
+			challenge.err = ErrMalformedToken
+			return nil, challenge
+		}
+		// The JWT is in the password field (everything after the first colon).
+		_, pw, hasSep := strings.Cut(string(decoded), ":")
+		if !hasSep || pw == "" {
+			challenge.err = ErrMalformedToken
+			return nil, challenge
+		}
+		rawToken = pw
+	default:
 		challenge.err = ErrTokenRequired
 		return nil, challenge
 	}

@@ -28,6 +28,7 @@ package coreweave
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -213,6 +214,7 @@ type accessController struct {
 // Errors returned as auth challenges.
 var (
 	errTokenRequired     = errors.New("authorization token required")
+	errMalformedToken    = errors.New("malformed token")
 	errWhoAmIFailed      = errors.New("token validation failed")
 	errInsufficientScope = errors.New("insufficient scope")
 )
@@ -482,13 +484,35 @@ func (ac *accessController) Authorized(r *http.Request, accessItems ...auth.Acce
 		scope:   scopeString(accessItems),
 	}
 
-	// Extract bearer token.
+	// Extract the token. Accept both Bearer and Basic auth:
+	//   Bearer <JWT>  — standard Docker token auth flow
+	//   Basic <b64>   — username:password where the password is the token;
+	//                   used by tools (e.g. zb) that only support Basic auth
 	prefix, rawToken, ok := strings.Cut(r.Header.Get("Authorization"), " ")
-	if !ok || rawToken == "" || !strings.EqualFold(strings.TrimSpace(prefix), "bearer") {
+	if !ok || rawToken == "" {
 		challenge.err = errTokenRequired
 		return nil, challenge
 	}
 	rawToken = strings.TrimSpace(rawToken)
+	switch {
+	case strings.EqualFold(strings.TrimSpace(prefix), "bearer"):
+		// rawToken is already the token — nothing to do.
+	case strings.EqualFold(strings.TrimSpace(prefix), "basic"):
+		decoded, err := base64.StdEncoding.DecodeString(rawToken)
+		if err != nil {
+			challenge.err = errMalformedToken
+			return nil, challenge
+		}
+		_, pw, hasSep := strings.Cut(string(decoded), ":")
+		if !hasSep || pw == "" {
+			challenge.err = errMalformedToken
+			return nil, challenge
+		}
+		rawToken = pw
+	default:
+		challenge.err = errTokenRequired
+		return nil, challenge
+	}
 
 	// Fast path: registry-issued JWT (from our own token endpoint).
 	// These are JWTs with iss == tokenIssuer, signed with our signing key.

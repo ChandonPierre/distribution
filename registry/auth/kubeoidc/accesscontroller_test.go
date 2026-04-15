@@ -4,6 +4,7 @@ import (
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -581,6 +582,52 @@ func TestOrgIDAvailableInPolicy(t *testing.T) {
 	}
 	if _, ok := err.(auth.Challenge); !ok {
 		t.Fatalf("expected auth.Challenge, got %T: %v", err, err)
+	}
+}
+
+func TestBasicAuthWithSAToken(t *testing.T) {
+	_, state := newTestServer(t)
+	policies := []policyConfig{
+		{Name: "allow-pull", Expression: `"pull" in request["actions"]`},
+	}
+	ctrl := newTestController(t, state, policies)
+
+	saToken := makeToken(t, state, validClaims(state))
+
+	// Build a Basic auth header: base64("serviceaccount:<JWT>")
+	creds := "serviceaccount:" + saToken
+	encoded := base64.StdEncoding.EncodeToString([]byte(creds))
+	req := httptest.NewRequest(http.MethodGet, "/v2/", nil)
+	req.Header.Set("Authorization", "Basic "+encoded)
+
+	grant, err := ctrl.Authorized(req, auth.Access{
+		Resource: auth.Resource{Type: "repository", Name: "myorg/myimage"},
+		Action:   "pull",
+	})
+	if err != nil {
+		t.Fatalf("expected success with Basic auth SA token, got: %v", err)
+	}
+	if grant.User.Name != "system:serviceaccount:ci:builder" {
+		t.Errorf("unexpected user: %s", grant.User.Name)
+	}
+}
+
+func TestBasicAuthMalformed(t *testing.T) {
+	_, state := newTestServer(t)
+	ctrl := newTestController(t, state, nil)
+
+	req := httptest.NewRequest(http.MethodGet, "/v2/", nil)
+	req.Header.Set("Authorization", "Basic not-valid-base64!!!")
+	_, err := ctrl.Authorized(req)
+	if err == nil {
+		t.Fatal("expected error for malformed Basic auth")
+	}
+	ch, ok := err.(auth.Challenge)
+	if !ok {
+		t.Fatal("expected auth.Challenge")
+	}
+	if ch.Error() != ErrMalformedToken.Error() {
+		t.Errorf("expected ErrMalformedToken, got: %v", ch.Error())
 	}
 }
 
