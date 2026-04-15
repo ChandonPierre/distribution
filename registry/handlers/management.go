@@ -64,9 +64,11 @@ func (h *namespaceHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		)
 		if err != nil {
 			if challenge, ok := err.(auth.Challenge); ok {
+				dcontext.GetLogger(r.Context()).Warnf("error authorizing context: %v", err)
 				challenge.SetHeaders(r, w)
 				w.WriteHeader(http.StatusUnauthorized)
 			} else {
+				dcontext.GetLogger(r.Context()).Warnf("forbidden: namespace %s %s: %v", action, h.name, err)
 				http.Error(w, "forbidden", http.StatusForbidden)
 			}
 			return

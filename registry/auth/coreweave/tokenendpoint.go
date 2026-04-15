@@ -196,9 +196,14 @@ func (h *tokenEndpointHandler) ServeHTTP(w http.ResponseWriter, r *http.Request)
 
 	ps := h.ac.policySet.Load()
 
+	// Qualify all requested scopes upfront so logs show the resolved names.
+	qualifiedScopes := make([]string, len(scopes))
+	for i, s := range scopes {
+		qualifiedScopes[i] = qualifyScope(s, namespace)
+	}
+
 	var grantedAccess []resourceActions
-	for _, scope := range scopes {
-		scope = qualifyScope(scope, namespace)
+	for _, scope := range qualifiedScopes {
 		if scope == "registry:catalog:*" {
 			if !anonymous || len(catalogPrefixesForPrincipal(ps, principalMap)) > 0 {
 				grantedAccess = append(grantedAccess, resourceActions{
@@ -234,24 +239,56 @@ func (h *tokenEndpointHandler) ServeHTTP(w http.ResponseWriter, r *http.Request)
 		}
 	}
 
+	// Build granted scope strings for logging and the JWT.
+	var grantedScopes []string
+	grantedSet := make(map[string]bool, len(grantedAccess))
+	for _, ra := range grantedAccess {
+		s := ra.Type + ":" + ra.Name + ":" + strings.Join(ra.Actions, ",")
+		grantedScopes = append(grantedScopes, s)
+		grantedSet[ra.Type+":"+ra.Name] = true
+	}
+
 	// Log every token issuance so operators have an audit trail of who got what.
+	// Include both requested and granted scopes so denials are immediately visible.
 	{
 		fields := logrus.Fields{
-			"sub":       sub,
-			"namespace": namespace,
-			"anonymous": anonymous,
+			"sub":              sub,
+			"namespace":        namespace,
+			"anonymous":        anonymous,
+			"requested_scopes": qualifiedScopes,
+			"granted_scopes":   grantedScopes,
 		}
 		if principalMap != nil {
 			if orgUID, ok := principalMap["org_uid"].(string); ok && orgUID != "" {
 				fields["org_uid"] = orgUID
 			}
 		}
-		var grantedScopes []string
-		for _, ra := range grantedAccess {
-			grantedScopes = append(grantedScopes, ra.Type+":"+ra.Name+":"+strings.Join(ra.Actions, ","))
-		}
-		fields["scopes"] = grantedScopes
 		logrus.WithFields(fields).Info("coreweave/token: access granted")
+	}
+
+	// Warn for each requested scope that was fully denied so operators can
+	// diagnose policy mismatches without digging through CEL expressions.
+	for _, scope := range qualifiedScopes {
+		parts := strings.SplitN(scope, ":", 3)
+		if len(parts) != 3 {
+			continue
+		}
+		key := parts[0] + ":" + parts[1]
+		if !grantedSet[key] {
+			logrus.WithFields(logrus.Fields{
+				"sub":       sub,
+				"namespace": namespace,
+				"org_uid": func() string {
+					if principalMap != nil {
+						if v, ok := principalMap["org_uid"].(string); ok {
+							return v
+						}
+					}
+					return ""
+				}(),
+				"denied_scope": scope,
+			}).Warn("coreweave/token: scope denied by policy")
+		}
 	}
 
 	claims := registryClaims{
