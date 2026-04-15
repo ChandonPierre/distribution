@@ -378,3 +378,33 @@ func TestSigningKeyReloaderHotSwap(t *testing.T) {
 		t.Error("expected key2 after hot swap")
 	}
 }
+
+func TestQualifyScope(t *testing.T) {
+	cases := []struct {
+		scope     string
+		namespace string
+		want      string
+	}{
+		// No namespace — pass through unchanged.
+		{"repository:image:pull", "", "repository:image:pull"},
+		// Already qualified — no double-prefix.
+		{"repository:foo/image:pull", "foo", "repository:foo/image:pull"},
+		// Multi-level path already under namespace — no double-prefix.
+		{"repository:foo/bar/image:pull", "foo", "repository:foo/bar/image:pull"},
+		// Multi-level path not under namespace — prepend namespace.
+		{"repository:bar/image:pull", "foo", "repository:foo/bar/image:pull"},
+		// Unqualified repository — prepend namespace.
+		{"repository:image:pull", "foo", "repository:foo/image:pull"},
+		{"repository:image:pull,push", "ns", "repository:ns/image:pull,push"},
+		// Non-repository scopes are untouched.
+		{"registry:catalog:*", "ns", "registry:catalog:*"},
+		// Malformed scope — pass through unchanged.
+		{"badscope", "ns", "badscope"},
+	}
+	for _, tc := range cases {
+		got := qualifyScope(tc.scope, tc.namespace)
+		if got != tc.want {
+			t.Errorf("qualifyScope(%q, %q) = %q; want %q", tc.scope, tc.namespace, got, tc.want)
+		}
+	}
+}

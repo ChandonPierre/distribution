@@ -413,9 +413,14 @@ func evaluateScopePolicy(ps *policySet, tokenMap map[string]any, scope string) (
 }
 
 // qualifyScope prepends namespace to the repository component of a scope string
-// when the repository name contains no "/" (i.e. is missing its namespace prefix).
+// when the name is not already prefixed with that namespace.
 // It is a no-op when namespace is empty or the scope is already qualified.
-// E.g. "repository:image:pull" + "foo" → "repository:foo/image:pull"
+//
+// Examples (namespace = "foo"):
+//
+//	"repository:image:pull"     → "repository:foo/image:pull"
+//	"repository:bar/image:pull" → "repository:foo/bar/image:pull"
+//	"repository:foo/image:pull" → "repository:foo/image:pull"  (already qualified)
 func qualifyScope(scope, namespace string) string {
 	if namespace == "" {
 		return scope
@@ -424,7 +429,7 @@ func qualifyScope(scope, namespace string) string {
 	if len(parts) != 3 {
 		return scope
 	}
-	if parts[0] == "repository" && !strings.Contains(parts[1], "/") {
+	if parts[0] == "repository" && !strings.HasPrefix(parts[1], namespace+"/") {
 		return "repository:" + namespace + "/" + parts[1] + ":" + parts[2]
 	}
 	return scope

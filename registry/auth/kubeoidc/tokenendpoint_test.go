@@ -562,6 +562,10 @@ func TestQualifyScope(t *testing.T) {
 		{"repository:image:pull", "", "repository:image:pull"},
 		// Already qualified — no double-prefix.
 		{"repository:foo/image:pull", "foo", "repository:foo/image:pull"},
+		// Multi-level path already under namespace — no double-prefix.
+		{"repository:foo/bar/image:pull", "foo", "repository:foo/bar/image:pull"},
+		// Multi-level path not under namespace — prepend namespace.
+		{"repository:bar/image:pull", "foo", "repository:foo/bar/image:pull"},
 		// Unqualified repository — prepend namespace.
 		{"repository:image:pull", "foo", "repository:foo/image:pull"},
 		{"repository:image:pull,push", "ns", "repository:ns/image:pull,push"},
