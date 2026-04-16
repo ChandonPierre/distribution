@@ -175,7 +175,7 @@ func newNamespacedS3Registry(
 	// Enable the storage redirect path when either the default is true or a
 	// per-request header override is configured. The conditionalRedirectDriver
 	// wrapper then applies the correct per-request decision at serve time.
-	registryOpts := registrymiddleware.GetRegistryOptions()
+	registryOpts := registrymiddleware.RegistryOptionsFromContext(ctx)
 	if redirectDefault || redirectHeader != "" {
 		registryOpts = append(registryOpts, storage.EnableRedirect)
 	}

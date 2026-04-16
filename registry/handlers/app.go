@@ -284,6 +284,14 @@ func NewApp(ctx context.Context, config *configuration.Configuration) *App {
 	}
 
 	// configure storage caches
+	//
+	// registryOptions tracks the complete set of options used to create
+	// app.registry. It is propagated back into the global registry-middleware
+	// option list so that registry middleware initialised later in this same
+	// startup path (e.g. namespaceds3) creates per-namespace registries with
+	// the same configuration (BlobDescriptorCacheProvider, manifest URL
+	// validation, image-index validation, etc.).
+	registryOptions := options
 	if cc, ok := config.Storage["cache"]; ok {
 		v, ok := cc["blobdescriptor"]
 		if !ok {
@@ -300,8 +308,8 @@ func NewApp(ctx context.Context, config *configuration.Configuration) *App {
 				dcontext.GetLogger(app).Warnf("blobdescriptorsize parameter is not supported with redis cache")
 			}
 			cacheProvider := rediscache.NewRedisBlobDescriptorCacheProvider(app.redis)
-			localOptions := append(options, storage.BlobDescriptorCacheProvider(cacheProvider))
-			app.registry, err = storage.NewRegistry(app, app.driver, localOptions...)
+			registryOptions = append(options, storage.BlobDescriptorCacheProvider(cacheProvider))
+			app.registry, err = storage.NewRegistry(app, app.driver, registryOptions...)
 			if err != nil {
 				panic("could not create registry: " + err.Error())
 			}
@@ -318,8 +326,8 @@ func NewApp(ctx context.Context, config *configuration.Configuration) *App {
 			}
 
 			cacheProvider := memorycache.NewInMemoryBlobDescriptorCacheProvider(blobDescriptorSize)
-			localOptions := append(options, storage.BlobDescriptorCacheProvider(cacheProvider))
-			app.registry, err = storage.NewRegistry(app, app.driver, localOptions...)
+			registryOptions = append(options, storage.BlobDescriptorCacheProvider(cacheProvider))
+			app.registry, err = storage.NewRegistry(app, app.driver, registryOptions...)
 			if err != nil {
 				panic("could not create registry: " + err.Error())
 			}
@@ -333,11 +341,16 @@ func NewApp(ctx context.Context, config *configuration.Configuration) *App {
 
 	if app.registry == nil {
 		// configure the registry if no cache section is available.
-		app.registry, err = storage.NewRegistry(app.Context, app.driver, options...)
+		app.registry, err = storage.NewRegistry(app.Context, app.driver, registryOptions...)
 		if err != nil {
 			panic("could not create registry: " + err.Error())
 		}
 	}
+
+	// Propagate the complete option set via context so that registry
+	// middleware initialised below (e.g. namespaceds3) picks up every option,
+	// including BlobDescriptorCacheProvider and validation options.
+	app.Context = registrymiddleware.WithRegistryOptions(app.Context, registryOptions)
 
 	app.registry, err = applyRegistryMiddleware(app, app.registry, app.driver, config.Middleware["registry"])
 	if err != nil {

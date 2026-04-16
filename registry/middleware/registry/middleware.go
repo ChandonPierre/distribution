@@ -55,3 +55,23 @@ func RegisterOptions(options ...storage.RegistryOption) error {
 func GetRegistryOptions() []storage.RegistryOption {
 	return registryoptions
 }
+
+type contextKey struct{}
+
+// WithRegistryOptions stores a complete RegistryOption slice in the context so
+// that registry middleware initialised via Get (e.g. namespaceds3) can retrieve
+// the full set assembled by the application, including options such as
+// BlobDescriptorCacheProvider that are added after RegisterOptions is called.
+func WithRegistryOptions(ctx context.Context, opts []storage.RegistryOption) context.Context {
+	return context.WithValue(ctx, contextKey{}, opts)
+}
+
+// RegistryOptionsFromContext returns the RegistryOption slice stored by
+// WithRegistryOptions, or the globally registered options when none has been
+// stored in the context.
+func RegistryOptionsFromContext(ctx context.Context) []storage.RegistryOption {
+	if opts, ok := ctx.Value(contextKey{}).([]storage.RegistryOption); ok {
+		return opts
+	}
+	return registryoptions
+}
