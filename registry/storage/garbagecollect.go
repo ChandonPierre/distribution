@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/distribution/distribution/v3"
 	"github.com/distribution/distribution/v3/registry/storage/driver"
@@ -21,6 +22,11 @@ type GCOpts struct {
 	DryRun         bool
 	RemoveUntagged bool
 	Quiet          bool
+	// GracePeriod skips deletion of blobs whose last-modified time is more
+	// recent than this duration. Set to a value longer than the longest
+	// expected blob-upload-to-manifest-put window (e.g. 1h) to prevent GC
+	// from deleting blobs that were uploaded concurrently with the mark phase.
+	GracePeriod time.Duration
 }
 
 // ManifestDel contains manifest structure which will be deleted
@@ -169,6 +175,26 @@ func MarkAndSweep(ctx context.Context, storageDriver driver.StorageDriver, regis
 		emit("\n%d blobs marked, %d blobs and %d manifests eligible for deletion", len(markSet), len(deleteSet), len(manifestArr))
 	}
 	for dgst := range deleteSet {
+		if opts.GracePeriod > 0 {
+			blobPath, err := pathFor(blobDataPathSpec{digest: dgst})
+			if err != nil {
+				return fmt.Errorf("failed to build path for blob %s: %v", dgst, err)
+			}
+			fi, err := storageDriver.Stat(ctx, blobPath)
+			if err != nil {
+				if _, ok := err.(driver.PathNotFoundError); ok {
+					// already gone; skip
+					continue
+				}
+				return fmt.Errorf("failed to stat blob %s: %v", dgst, err)
+			}
+			if age := time.Since(fi.ModTime()); age < opts.GracePeriod {
+				if !opts.Quiet {
+					emit("blob %s skipped (age %s < grace period %s)", dgst, age.Round(time.Second), opts.GracePeriod)
+				}
+				continue
+			}
+		}
 		if !opts.Quiet {
 			emit("blob eligible for deletion: %s", dgst)
 		}

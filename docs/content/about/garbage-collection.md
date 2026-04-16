@@ -80,9 +80,11 @@ the blobs and if a blob's content address digest is not in the mark set, the
 process deletes it.
 
 
-> **Note**: You should ensure that the registry is in read-only mode or not running at
-> all. If you were to upload an image while garbage collection is running, there is the
-> risk that the image's layers are mistakenly deleted leading to a corrupted image.
+> **Note**: If the registry is accepting writes while garbage collection runs, there is a
+> risk that a blob uploaded after the mark phase completes will be deleted before its
+> manifest is committed, corrupting the image. Use `--grace-period` (see below) to
+> mitigate this without taking the registry offline, or ensure the registry is in
+> read-only mode before running garbage collection.
 
 This type of garbage collection is known as stop-the-world garbage collection.
 
@@ -90,7 +92,7 @@ This type of garbage collection is known as stop-the-world garbage collection.
 
 Garbage collection can be run as follows
 
-`bin/registry garbage-collect [--dry-run] [--delete-untagged] [--quiet] /path/to/config.yml`
+`bin/registry garbage-collect [--dry-run] [--delete-untagged] [--quiet] [--grace-period=DURATION] /path/to/config.yml`
 
 The garbage-collect command accepts a `--dry-run` parameter, which prints the progress
 of the mark and sweep phases without removing any data. Running with a log level of `info`
@@ -126,4 +128,13 @@ blob eligible for deletion: sha256:f251d679a7c61455f06d793e43c06786d7766c88b8c24
 The `--delete-untagged` option can be used to delete manifests that are not currently referenced by a tag.
 
 The `--quiet` option suppresses any output from being printed.
+
+The `--grace-period` option skips deletion of blobs whose last-modified time is more
+recent than the specified duration (e.g. `--grace-period=1h`). This allows garbage
+collection to run safely against a live registry: any blob uploaded during or after the
+mark phase is too young to be deleted, so it cannot be removed before its manifest is
+committed. The grace period should be set to at least as long as the slowest expected
+image push. It is supported by both the filesystem and object storage (S3, GCS, Azure)
+drivers, which all report accurate last-modified times. When omitted, no age check is
+performed.
 
