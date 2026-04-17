@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/distribution/distribution/v3"
@@ -11,6 +12,8 @@ import (
 	"github.com/distribution/reference"
 	"github.com/opencontainers/go-digest"
 	v1 "github.com/opencontainers/image-spec/specs-go/v1"
+	"golang.org/x/sync/errgroup"
+	"golang.org/x/sync/semaphore"
 )
 
 func emit(format string, a ...any) {
@@ -22,6 +25,7 @@ type GCOpts struct {
 	DryRun         bool
 	RemoveUntagged bool
 	Quiet          bool
+	Workers        int // number of concurrent manifest workers; 0 or 1 = sequential
 	// GracePeriod skips deletion of blobs whose last-modified time is more
 	// recent than this duration. Set to a value longer than the longest
 	// expected blob-upload-to-manifest-put window (e.g. 1h) to prevent GC
@@ -43,16 +47,22 @@ func MarkAndSweep(ctx context.Context, storageDriver driver.StorageDriver, regis
 		return fmt.Errorf("unable to convert Namespace to RepositoryEnumerator")
 	}
 
+	workers := opts.Workers
+	if workers <= 0 {
+		workers = 1
+	}
+
 	// mark
+	var mu sync.Mutex
 	markSet := make(map[digest.Digest]struct{})
 	deleteLayerSet := make(map[string][]digest.Digest)
 	manifestArr := make([]ManifestDel, 0)
+
 	err := repositoryEnumerator.Enumerate(ctx, func(repoName string) error {
 		if !opts.Quiet {
 			emit(repoName)
 		}
 
-		var err error
 		named, err := reference.WithName(repoName)
 		if err != nil {
 			return fmt.Errorf("failed to parse repo name %s: %v", repoName, err)
@@ -72,49 +82,14 @@ func MarkAndSweep(ctx context.Context, storageDriver driver.StorageDriver, regis
 			return fmt.Errorf("unable to convert ManifestService into ManifestEnumerator")
 		}
 
+		// Collect all manifest digests for this repository first, then process
+		// them in parallel. This avoids holding the enumerator open while
+		// issuing concurrent storage requests.
+		var dgsts []digest.Digest
 		err = manifestEnumerator.Enumerate(ctx, func(dgst digest.Digest) error {
-			if opts.RemoveUntagged {
-				// fetch all tags where this manifest is the latest one
-				tags, err := repository.Tags(ctx).Lookup(ctx, v1.Descriptor{Digest: dgst})
-				if err != nil {
-					return fmt.Errorf("failed to retrieve tags for digest %v: %v", dgst, err)
-				}
-				if len(tags) == 0 {
-					// fetch all tags from repository
-					// all of these tags could contain manifest in history
-					// which means that we need check (and delete) those references when deleting manifest
-					allTags, err := repository.Tags(ctx).All(ctx)
-					if err != nil {
-						if _, ok := err.(distribution.ErrRepositoryUnknown); ok {
-							if !opts.Quiet {
-								emit("manifest tags path of repository %s does not exist", repoName)
-							}
-							return nil
-						}
-						return fmt.Errorf("failed to retrieve tags %v", err)
-					}
-					manifestArr = append(manifestArr, ManifestDel{Name: repoName, Digest: dgst, Tags: allTags})
-					return nil
-				}
-			}
-			// Mark the manifest's blob
-			if !opts.Quiet {
-				emit("%s: marking manifest %s ", repoName, dgst)
-			}
-			markSet[dgst] = struct{}{}
-
-			return markManifestReferences(dgst, manifestService, ctx, func(d digest.Digest) bool {
-				_, marked := markSet[d]
-				if !marked {
-					markSet[d] = struct{}{}
-					if !opts.Quiet {
-						emit("%s: marking blob %s", repoName, d)
-					}
-				}
-				return marked
-			})
+			dgsts = append(dgsts, dgst)
+			return nil
 		})
-
 		if err != nil {
 			// In certain situations such as unfinished uploads, deleting all
 			// tags in S3 or removing the _manifests folder manually, this
@@ -125,6 +100,23 @@ func MarkAndSweep(ctx context.Context, storageDriver driver.StorageDriver, regis
 				return err
 			}
 		}
+
+		// Process manifests with a bounded worker pool.
+		g, gctx := errgroup.WithContext(ctx)
+		sem := semaphore.NewWeighted(int64(workers))
+		for _, dgst := range dgsts {
+			if err := sem.Acquire(gctx, 1); err != nil {
+				return err
+			}
+			g.Go(func() error {
+				defer sem.Release(1)
+				return markManifest(gctx, dgst, repoName, repository, manifestService, &mu, markSet, &manifestArr, opts)
+			})
+		}
+		if err := g.Wait(); err != nil {
+			return err
+		}
+
 		blobService := repository.Blobs(ctx)
 		layerEnumerator, ok := blobService.(distribution.ManifestEnumerator)
 		if !ok {
@@ -133,7 +125,10 @@ func MarkAndSweep(ctx context.Context, storageDriver driver.StorageDriver, regis
 
 		var deleteLayers []digest.Digest
 		err = layerEnumerator.Enumerate(ctx, func(dgst digest.Digest) error {
-			if _, ok := markSet[dgst]; !ok {
+			mu.Lock()
+			_, marked := markSet[dgst]
+			mu.Unlock()
+			if !marked {
 				deleteLayers = append(deleteLayers, dgst)
 			}
 			return nil
@@ -163,7 +158,10 @@ func MarkAndSweep(ctx context.Context, storageDriver driver.StorageDriver, regis
 	deleteSet := make(map[digest.Digest]struct{})
 	err = blobService.Enumerate(ctx, func(dgst digest.Digest) error {
 		// check if digest is in markSet. If not, delete it!
-		if _, ok := markSet[dgst]; !ok {
+		mu.Lock()
+		_, marked := markSet[dgst]
+		mu.Unlock()
+		if !marked {
 			deleteSet[dgst] = struct{}{}
 		}
 		return nil
@@ -223,6 +221,73 @@ func MarkAndSweep(ctx context.Context, storageDriver driver.StorageDriver, regis
 	}
 
 	return err
+}
+
+// markManifest marks a single manifest digest and all blobs it references.
+// It is safe to call concurrently; all shared state is protected by mu.
+func markManifest(ctx context.Context, dgst digest.Digest, repoName string,
+	repository distribution.Repository, manifestService distribution.ManifestService,
+	mu *sync.Mutex, markSet map[digest.Digest]struct{},
+	manifestArr *[]ManifestDel, opts GCOpts) error {
+
+	if opts.RemoveUntagged {
+		// fetch all tags where this manifest is the latest one
+		tags, err := repository.Tags(ctx).Lookup(ctx, v1.Descriptor{Digest: dgst})
+		if err != nil {
+			return fmt.Errorf("failed to retrieve tags for digest %v: %v", dgst, err)
+		}
+		if len(tags) == 0 {
+			// fetch all tags from repository
+			// all of these tags could contain manifest in history
+			// which means that we need check (and delete) those references when deleting manifest
+			allTags, err := repository.Tags(ctx).All(ctx)
+			if err != nil {
+				if _, ok := err.(distribution.ErrRepositoryUnknown); ok {
+					if !opts.Quiet {
+						emit("manifest tags path of repository %s does not exist", repoName)
+					}
+					return nil
+				}
+				return fmt.Errorf("failed to retrieve tags %v", err)
+			}
+			mu.Lock()
+			*manifestArr = append(*manifestArr, ManifestDel{Name: repoName, Digest: dgst, Tags: allTags})
+			mu.Unlock()
+			return nil
+		}
+	}
+
+	// Early exit: if this digest was already marked (e.g., referenced by a manifest
+	// index in another repo, or a duplicate in this repo), skip the manifest Get()
+	// entirely. The ingester in markManifestReferences already deduplicates blobs,
+	// but this check avoids the more expensive manifest fetch at the outer level.
+	mu.Lock()
+	_, alreadyMarked := markSet[dgst]
+	if !alreadyMarked {
+		markSet[dgst] = struct{}{}
+	}
+	mu.Unlock()
+
+	if alreadyMarked {
+		return nil
+	}
+
+	if !opts.Quiet {
+		emit("%s: marking manifest %s ", repoName, dgst)
+	}
+
+	return markManifestReferences(dgst, manifestService, ctx, func(d digest.Digest) bool {
+		mu.Lock()
+		defer mu.Unlock()
+		_, marked := markSet[d]
+		if !marked {
+			markSet[d] = struct{}{}
+			if !opts.Quiet {
+				emit("%s: marking blob %s", repoName, d)
+			}
+		}
+		return marked
+	})
 }
 
 // unmarkReferencedManifest filters out manifest present in markSet

@@ -20,6 +20,7 @@ func init() {
 	GCCmd.Flags().BoolVarP(&dryRun, "dry-run", "d", false, "do everything except remove the blobs")
 	GCCmd.Flags().BoolVarP(&removeUntagged, "delete-untagged", "m", false, "delete manifests that are not currently referenced via tag")
 	GCCmd.Flags().BoolVarP(&quiet, "quiet", "q", false, "silence output")
+	GCCmd.Flags().IntVarP(&workers, "workers", "w", 1, "number of concurrent manifest workers during the mark phase")
 	GCCmd.Flags().DurationVar(&gracePeriod, "grace-period", 0, "skip blobs modified more recently than this duration (e.g. 1h); protects blobs uploaded concurrently with the mark phase")
 	RootCmd.Flags().BoolVarP(&showVersion, "version", "v", false, "show the version and exit")
 }
@@ -43,6 +44,7 @@ var (
 	dryRun         bool
 	removeUntagged bool
 	quiet          bool
+	workers        int
 	gracePeriod    time.Duration
 )
 
@@ -83,6 +85,7 @@ var GCCmd = &cobra.Command{
 			DryRun:         dryRun,
 			RemoveUntagged: removeUntagged,
 			Quiet:          quiet,
+			Workers:        workers,
 			GracePeriod:    gracePeriod,
 		})
 		if err != nil {

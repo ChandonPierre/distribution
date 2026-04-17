@@ -92,7 +92,7 @@ This type of garbage collection is known as stop-the-world garbage collection.
 
 Garbage collection can be run as follows
 
-`bin/registry garbage-collect [--dry-run] [--delete-untagged] [--quiet] [--grace-period=DURATION] /path/to/config.yml`
+`bin/registry garbage-collect [--dry-run] [--delete-untagged] [--quiet] [--workers=N] [--grace-period=DURATION] /path/to/config.yml`
 
 The garbage-collect command accepts a `--dry-run` parameter, which prints the progress
 of the mark and sweep phases without removing any data. Running with a log level of `info`
@@ -128,6 +128,14 @@ blob eligible for deletion: sha256:f251d679a7c61455f06d793e43c06786d7766c88b8c24
 The `--delete-untagged` option can be used to delete manifests that are not currently referenced by a tag.
 
 The `--quiet` option suppresses any output from being printed.
+
+The `--workers` option controls how many manifests are fetched and marked concurrently
+during the mark phase. The default is `1` (sequential). For registries backed by object
+storage (S3, GCS, Azure), increasing this value (e.g. `--workers=8`) can significantly
+reduce the time taken to mark large repositories by parallelising the per-manifest
+storage requests. There is no benefit to setting workers higher than the number of
+manifests in the largest repository, and very high values may increase memory usage
+and storage API request rates.
 
 The `--grace-period` option skips deletion of blobs whose last-modified time is more
 recent than the specified duration (e.g. `--grace-period=1h`). This allows garbage
