@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -99,6 +100,24 @@ type accessController struct {
 	signingKey atomic.Pointer[signingKeyState]
 	// tokenIssuer is the expected "iss" value for registry-issued tokens.
 	tokenIssuer string
+
+	// stopReloaders is closed by Close to signal background policy and
+	// signing-key reloader goroutines to exit.
+	stopReloaders chan struct{}
+	stopOnce      sync.Once
+}
+
+// Close stops any background reloaders started for this access controller.
+// It is safe to call multiple times. Today it is called only by tests to
+// avoid goroutine leaks; production registries run these reloaders for the
+// process lifetime.
+func (ac *accessController) Close() error {
+	ac.stopOnce.Do(func() {
+		if ac.stopReloaders != nil {
+			close(ac.stopReloaders)
+		}
+	})
+	return nil
 }
 
 // Errors used and exported by this package.
@@ -309,10 +328,11 @@ func newAccessController(options map[string]any) (auth.AccessController, error) 
 	}
 
 	ac := &accessController{
-		realm:       cfg.Realm,
-		service:     cfg.Service,
-		issuerCache: issuerCache,
-		tokenIssuer: tokenIssuer,
+		realm:         cfg.Realm,
+		service:       cfg.Service,
+		issuerCache:   issuerCache,
+		tokenIssuer:   tokenIssuer,
+		stopReloaders: make(chan struct{}),
 	}
 	ac.signingKey.Store(&signingKeyState{
 		privateKey: initialKey,
@@ -322,10 +342,10 @@ func newAccessController(options map[string]any) (auth.AccessController, error) 
 	ac.policySet.Store(&policySet{policies: compiled})
 
 	if cfg.PolicyFile != "" {
-		startPolicyReloader(cfg.PolicyFile, reloadInterval, &ac.policySet, celEnv)
+		startPolicyReloader(ac.stopReloaders, cfg.PolicyFile, reloadInterval, &ac.policySet, celEnv)
 	}
 	if cfg.SigningKey != "" {
-		startSigningKeyReloader(cfg.SigningKey, reloadInterval, &ac.signingKey)
+		startSigningKeyReloader(ac.stopReloaders, cfg.SigningKey, reloadInterval, &ac.signingKey)
 	}
 
 	ac.tokenEndpoint = &tokenEndpointHandler{

@@ -225,7 +225,9 @@ func TestLivePolicyReload_Success(t *testing.T) {
 	_, _ = f.WriteString("policies:\n  - name: allow-pull\n    expression: '\"pull\" in request[\"actions\"]'\n")
 	f.Close()
 
-	startPolicyReloader(f.Name(), 50*time.Millisecond, &ptr, env)
+	stop := make(chan struct{})
+	t.Cleanup(func() { close(stop) })
+	startPolicyReloader(stop, f.Name(), 50*time.Millisecond, &ptr, env)
 	time.Sleep(200 * time.Millisecond)
 
 	ps := ptr.Load()
@@ -265,7 +267,9 @@ func TestLivePolicyReload_InvalidKeepsOld(t *testing.T) {
 	_, _ = f.WriteString("policies:\n  - name: bad\n    expression: 'this === invalid'\n")
 	f.Close()
 
-	startPolicyReloader(f.Name(), 50*time.Millisecond, &ptr, env)
+	stop := make(chan struct{})
+	t.Cleanup(func() { close(stop) })
+	startPolicyReloader(stop, f.Name(), 50*time.Millisecond, &ptr, env)
 	time.Sleep(200 * time.Millisecond)
 
 	// Policy set should still be the old one (allow all).
@@ -304,7 +308,9 @@ func TestLivePolicyReload_NoChangeSkipped(t *testing.T) {
 	_, _ = f.WriteString("policies:\n  - name: allow\n    expression: 'true'\n")
 	f.Close()
 
-	startPolicyReloader(f.Name(), 50*time.Millisecond, &ptr, env)
+	stop := make(chan struct{})
+	t.Cleanup(func() { close(stop) })
+	startPolicyReloader(stop, f.Name(), 50*time.Millisecond, &ptr, env)
 	time.Sleep(200 * time.Millisecond)
 
 	// Write same content again; the pointer should have been replaced once (first load),

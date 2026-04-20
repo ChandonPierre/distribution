@@ -173,12 +173,19 @@ func loadPolicyFile(path string) ([]policyConfig, error) {
 
 // startPolicyReloader polls a policy file and atomically replaces the policySet when valid.
 // If a reload produces a compile error, the previous policySet remains active.
-func startPolicyReloader(path string, interval time.Duration, ptr *atomic.Pointer[policySet], env *cel.Env) {
+// The goroutine exits when stop is closed so tests and any future graceful-
+// shutdown path don't leak a ticker per reloader.
+func startPolicyReloader(stop <-chan struct{}, path string, interval time.Duration, ptr *atomic.Pointer[policySet], env *cel.Env) {
 	var lastHash [32]byte
 	go func() {
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
-		for range ticker.C {
+		for {
+			select {
+			case <-stop:
+				return
+			case <-ticker.C:
+			}
 			data, err := os.ReadFile(path)
 			if err != nil {
 				logrus.Warnf("kubeoidc: policy reloader cannot read %q: %v", path, err)

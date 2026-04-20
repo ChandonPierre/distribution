@@ -491,13 +491,20 @@ func qualifyScope(scope, namespace string) string {
 
 // startSigningKeyReloader polls path on interval and atomically replaces the
 // signingKeyState when the file changes. On parse error the previous key stays
-// active so in-flight tokens continue to validate.
-func startSigningKeyReloader(path string, interval time.Duration, ptr *atomic.Pointer[signingKeyState]) {
+// active so in-flight tokens continue to validate. The goroutine exits when
+// stop is closed, which lets tests and any future graceful-shutdown path
+// avoid leaking a ticker per reloader.
+func startSigningKeyReloader(stop <-chan struct{}, path string, interval time.Duration, ptr *atomic.Pointer[signingKeyState]) {
 	var lastHash [32]byte
 	go func() {
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
-		for range ticker.C {
+		for {
+			select {
+			case <-stop:
+				return
+			case <-ticker.C:
+			}
 			data, err := os.ReadFile(path)
 			if err != nil {
 				logrus.Warnf("kubeoidc: signing key reloader cannot read %q: %v", path, err)

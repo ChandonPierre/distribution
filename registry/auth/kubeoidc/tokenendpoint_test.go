@@ -13,7 +13,9 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"os"
+	"runtime"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -566,6 +568,46 @@ func TestLoadOrGenerateSigningKey(t *testing.T) {
 			t.Errorf("expected error to mention P-256, got: %v", err)
 		}
 	})
+}
+
+func TestSigningKeyReloaderExitsOnStop(t *testing.T) {
+	k, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	path := writePEMKey(t, k)
+
+	var ptr atomic.Pointer[signingKeyState]
+	_, kid, err := loadOrGenerateSigningKey(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ptr.Store(&signingKeyState{privateKey: k, publicKey: &k.PublicKey, keyID: kid})
+
+	// Let the runtime quiesce before sampling, so unrelated test
+	// goroutines don't inflate the baseline.
+	time.Sleep(50 * time.Millisecond)
+	baseline := runtime.NumGoroutine()
+
+	stop := make(chan struct{})
+	startSigningKeyReloader(stop, path, 10*time.Millisecond, &ptr)
+
+	// Give the reloader a few ticks, then confirm it's live.
+	time.Sleep(50 * time.Millisecond)
+	if runtime.NumGoroutine() <= baseline {
+		t.Fatalf("expected reloader goroutine to be running; NumGoroutine=%d, baseline=%d",
+			runtime.NumGoroutine(), baseline)
+	}
+
+	close(stop)
+
+	// The reloader should exit within a few ticks of stop being closed.
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if runtime.NumGoroutine() <= baseline {
+			return // reloader exited as expected
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("reloader goroutine did not exit after stop; NumGoroutine=%d, baseline=%d",
+		runtime.NumGoroutine(), baseline)
 }
 
 func TestQualifyScope(t *testing.T) {
