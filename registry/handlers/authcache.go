@@ -125,14 +125,31 @@ func sortedScopeString(items []auth.Access) string {
 	return strings.Join(parts, " ")
 }
 
-// extractBearerToken returns the raw JWT from the Authorization header, or ""
-// if absent or malformed.
+// extractBearerToken returns the raw JWT from the Authorization header.
+// It supports both "Bearer <JWT>" and the Basic-auth form where the password
+// field holds the JWT (username is ignored).
+// Returns "" if the header is absent, malformed, or does not yield a JWT.
 func extractBearerToken(r *http.Request) string {
 	prefix, raw, ok := strings.Cut(r.Header.Get("Authorization"), " ")
-	if !ok || !strings.EqualFold(prefix, "bearer") {
+	if !ok {
 		return ""
 	}
-	return strings.TrimSpace(raw)
+	switch {
+	case strings.EqualFold(prefix, "bearer"):
+		return strings.TrimSpace(raw)
+	case strings.EqualFold(prefix, "basic"):
+		decoded, err := base64.StdEncoding.DecodeString(strings.TrimSpace(raw))
+		if err != nil {
+			return ""
+		}
+		// The JWT is carried in the password (everything after the first colon).
+		_, pw, hasSep := strings.Cut(string(decoded), ":")
+		if !hasSep {
+			return ""
+		}
+		return strings.TrimSpace(pw)
+	}
+	return ""
 }
 
 // jwtRemainingTTL decodes the `exp` claim from the JWT body without verifying
