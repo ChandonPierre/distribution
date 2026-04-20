@@ -1,11 +1,13 @@
 package kubeoidc
 
 import (
+	"crypto"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/x509"
+	"encoding/base64"
 	"encoding/json"
 	"encoding/pem"
 	"fmt"
@@ -46,8 +48,12 @@ type resourceActions struct {
 }
 
 // loadOrGenerateSigningKey loads an ECDSA P-256 private key from a PEM file, or
-// generates an ephemeral one if no path is given.
+// generates an ephemeral one if no path is given. The returned key ID is a
+// base64url JWK thumbprint (RFC 7638) derived from the public key, which stays
+// stable across hot-reloads of the same key material but changes when the key
+// rotates so old and new public keys can coexist in JWKS under distinct kids.
 func loadOrGenerateSigningKey(path string) (*ecdsa.PrivateKey, string, error) {
+	var key *ecdsa.PrivateKey
 	if path != "" {
 		data, err := os.ReadFile(path)
 		if err != nil {
@@ -59,39 +65,55 @@ func loadOrGenerateSigningKey(path string) (*ecdsa.PrivateKey, string, error) {
 		}
 		switch block.Type {
 		case "EC PRIVATE KEY":
-			key, err := x509.ParseECPrivateKey(block.Bytes)
+			k, err := x509.ParseECPrivateKey(block.Bytes)
 			if err != nil {
 				return nil, "", fmt.Errorf("parsing EC private key: %w", err)
 			}
-			if key.Curve != elliptic.P256() {
-				return nil, "", fmt.Errorf("signing key must use P-256 curve (ES256); got %s", key.Curve.Params().Name)
-			}
-			return key, path, nil
+			key = k
 		case "PRIVATE KEY":
 			raw, err := x509.ParsePKCS8PrivateKey(block.Bytes)
 			if err != nil {
 				return nil, "", fmt.Errorf("parsing PKCS8 private key: %w", err)
 			}
-			key, ok := raw.(*ecdsa.PrivateKey)
+			k, ok := raw.(*ecdsa.PrivateKey)
 			if !ok {
 				return nil, "", fmt.Errorf("signing key file must contain an ECDSA private key")
 			}
-			if key.Curve != elliptic.P256() {
-				return nil, "", fmt.Errorf("signing key must use P-256 curve (ES256); got %s", key.Curve.Params().Name)
-			}
-			return key, path, nil
+			key = k
 		default:
 			return nil, "", fmt.Errorf("unsupported PEM block type %q in signing key file", block.Type)
 		}
+		if key.Curve != elliptic.P256() {
+			return nil, "", fmt.Errorf("signing key must use P-256 curve (ES256); got %s", key.Curve.Params().Name)
+		}
+	} else {
+		k, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+		if err != nil {
+			return nil, "", fmt.Errorf("generating ephemeral signing key: %w", err)
+		}
+		key = k
+		logrus.Warn("kubeoidc: no signing_key configured — using ephemeral key; tokens will be invalidated on restart")
 	}
 
-	// Generate ephemeral key.
-	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	kid, err := publicKeyThumbprint(&key.PublicKey)
 	if err != nil {
-		return nil, "", fmt.Errorf("generating ephemeral signing key: %w", err)
+		return nil, "", fmt.Errorf("computing signing key thumbprint: %w", err)
 	}
-	logrus.Warn("kubeoidc: no signing_key configured — using ephemeral key; tokens will be invalidated on restart")
-	return key, "", nil
+	return key, kid, nil
+}
+
+// publicKeyThumbprint returns the RFC 7638 JWK thumbprint of pub, base64url
+// encoded (unpadded). It is deterministic per public key and changes when the
+// key rotates, so a hot-reload to a new key produces a new kid — preventing
+// clients that cached the old JWKS from silently using the new public key to
+// verify tokens signed with the old private key.
+func publicKeyThumbprint(pub *ecdsa.PublicKey) (string, error) {
+	jwk := jose.JSONWebKey{Key: pub}
+	tp, err := jwk.Thumbprint(crypto.SHA256)
+	if err != nil {
+		return "", err
+	}
+	return base64.RawURLEncoding.EncodeToString(tp), nil
 }
 
 // signingKeyState holds a key pair that can be atomically replaced on hot-reload.
@@ -485,7 +507,7 @@ func startSigningKeyReloader(path string, interval time.Duration, ptr *atomic.Po
 			if hash == lastHash {
 				continue
 			}
-			key, _, err := loadOrGenerateSigningKey(path)
+			key, kid, err := loadOrGenerateSigningKey(path)
 			if err != nil {
 				logrus.Warnf("kubeoidc: signing key reloader failed to load %q: %v — keeping previous key", path, err)
 				continue
@@ -493,10 +515,10 @@ func startSigningKeyReloader(path string, interval time.Duration, ptr *atomic.Po
 			ptr.Store(&signingKeyState{
 				privateKey: key,
 				publicKey:  &key.PublicKey,
-				keyID:      path,
+				keyID:      kid,
 			})
 			lastHash = hash
-			logrus.Infof("kubeoidc: reloaded signing key from %q", path)
+			logrus.Infof("kubeoidc: reloaded signing key from %q (kid=%s)", path, kid)
 		}
 	}()
 }

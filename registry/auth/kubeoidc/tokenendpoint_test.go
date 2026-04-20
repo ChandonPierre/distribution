@@ -481,8 +481,8 @@ func TestLoadOrGenerateSigningKey(t *testing.T) {
 		if key == nil {
 			t.Fatal("expected non-nil key")
 		}
-		if id != "" {
-			t.Errorf("expected empty key ID for ephemeral key, got %q", id)
+		if id == "" {
+			t.Error("expected non-empty JWK thumbprint key ID")
 		}
 		if key.Curve != elliptic.P256() {
 			t.Errorf("expected P-256, got %s", key.Curve.Params().Name)
@@ -499,8 +499,24 @@ func TestLoadOrGenerateSigningKey(t *testing.T) {
 		if key.Curve != elliptic.P256() {
 			t.Errorf("expected P-256, got %s", key.Curve.Params().Name)
 		}
-		if id != path {
-			t.Errorf("expected key ID == path, got %q", id)
+		want, err := publicKeyThumbprint(&k.PublicKey)
+		if err != nil {
+			t.Fatalf("thumbprint: %v", err)
+		}
+		if id != want {
+			t.Errorf("expected key ID == %q (JWK thumbprint), got %q", want, id)
+		}
+
+		// Different key material must produce a different kid so JWKS entries
+		// don't collide under hot-reload.
+		k2, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+		path2 := writePEMKey(t, k2)
+		_, id2, err := loadOrGenerateSigningKey(path2)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if id == id2 {
+			t.Error("expected distinct kids for distinct keys")
 		}
 	})
 
